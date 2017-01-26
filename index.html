@@ -1,0 +1,21 @@
+<html>
+<head>
+<script src="olm.js"></script>
+<script src="browser-matrix.js"></script>
+<script src="stress-test.js"></script>
+</head>
+<body>
+	<form id="entryform">
+		<label for="input-user-id">User ID:</label>
+		<input id="input-user-id" type="text"/>
+		<label for="input-password">Password:</label>
+		<input id="input-password" type="password"/>
+		<label>Server:</label>
+		<input id="input-server" type="text" value="http://localhost:8008"/>
+		<label>Room id:</label>
+		<input id="input-room" type="text"/>
+		<input type="submit"/>
+	</form>
+	<textarea id="errors" readonly="true" cols=100 rows=5 style="border-style:none"></textarea>
+	<div id="results" />
+</body>
