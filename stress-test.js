@@ -50,11 +50,13 @@ function createClient(user, pass, srv, room_id) {
 }
 
 function createClientFromCreds(srv, creds, room_id) {
+    var sessionStore = new matrixcs.WebStorageSessionStore(localStorage);
     var matrixClient = matrixcs.createClient({
         baseUrl: srv,
         accessToken: creds.access_token,
         userId: creds.user_id,
         deviceId: creds.device_id,
+        sessionStore: sessionStore,
     });
 
     clientInstance = new ClientInstance(matrixClient, room_id);
@@ -72,28 +74,34 @@ class ClientInstance {
 
     start() {
         var syncState;
-        this._matrixClient.on("sync", function(newstate) {
-            if (newstate != syncState) {
-                addOutput("** SYNC STATE *: " + newstate);
-                syncState = newstate;
+        var initialSynced = false;
+
+        this._matrixClient.on("sync", (newstate) => {
+            if (newstate == syncState) {
+                return;
+            }
+
+            addOutput("** SYNC STATE: " + newstate);
+            syncState = newstate;
+            if (syncState === "PREPARED" && !initialSynced) {
+                initialSynced = true;
+                this.startSending();
             }
         });
         this._matrixClient.on("Room.timeline",
             this.onRoomEvent.bind(this));
         this._matrixClient.startClient();
-        this.startSending();
     }
 
-    stopClient() {
+    stop() {
         this._matrixClient.stopClient();
         this._matrixClient = null;
-        this.startSending();
         setButtonAction("button-start", null);
         setButtonAction("button-stop", null);
     }
 
     startSending() {
-        this._sendCallback = window.setTimeout(this.doSend, 10);
+        this._sendCallback = window.setTimeout(this.doSend, 0);
 
         setButtonAction("button-start", null);
         setButtonAction("button-stop", () => this.stopSending());
