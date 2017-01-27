@@ -81,18 +81,33 @@ class ClientInstance {
         this._matrixClient.on("Room.timeline",
             this.onRoomEvent.bind(this));
         this._matrixClient.startClient();
-
-        this.sendCallback = window.setTimeout(this.doSend, 10);
+        this.startSending();
     }
 
     stopClient() {
         this._matrixClient.stopClient();
         this._matrixClient = null;
+        this.startSending();
+        setButtonAction("button-start", null);
+        setButtonAction("button-stop", null);
+    }
+
+    startSending() {
+        this._sendCallback = window.setTimeout(this.doSend, 10);
+
+        setButtonAction("button-start", null);
+        setButtonAction("button-stop", () => this.stopSending());
+    }
+
+    stopSending() {
         if (this._sendCallback !== null) {
-            window.clearTimeout(sendCallback);
+            window.clearTimeout(this._sendCallback);
             this._sendCallback = null;
         }
+        setButtonAction("button-start", () => this.startSending());
+        setButtonAction("button-stop", null);
     }
+
 
     onRoomEvent(ev, room, toStartOfTimeline) {
         console.log("room event", arguments);
@@ -148,4 +163,10 @@ function showError(e) {
 
 function clearErrors() {
     document.getElementById('errors').value = "";
+}
+
+function setButtonAction(id, callback) {
+    var button = document.getElementById(id);
+    button.disabled = !callback;
+    button.onclick = callback;
 }
