@@ -42,6 +42,7 @@ function createClient(user, pass, srv, room_id) {
 
     tmpClient.loginWithPassword(user, pass).then((r) => {
         addOutput("Logged in as " + r.user_id + ":" + r.device_id);
+        localStorage.clear();
         localStorage["hs"] = srv;
         localStorage["creds"] = JSON.stringify(r);
         localStorage["room_id"] = room_id;
@@ -66,10 +67,9 @@ function createClientFromCreds(srv, creds, room_id) {
 class ClientInstance {
     constructor(matrixClient, roomId) {
         this._matrixClient = matrixClient;
-        this._sendCallback = null;
+        this._stopSending = null;
         this._roomId = roomId;
         this._msgCounter = 0;
-        this.doSend = this.doSend.bind(this);
     }
 
     start() {
@@ -90,10 +90,13 @@ class ClientInstance {
         });
         this._matrixClient.on("Room.timeline",
             this.onRoomEvent.bind(this));
-        this._matrixClient.startClient();
+        this._matrixClient.startClient({
+            pendingEventOrdering: "detached",
+        });
     }
 
     stop() {
+        this.stopSending();
         this._matrixClient.stopClient();
         this._matrixClient = null;
         setButtonAction("button-start", null);
@@ -101,39 +104,56 @@ class ClientInstance {
     }
 
     startSending() {
-        this._sendCallback = window.setTimeout(this.doSend, 0);
+        if(!this._stopSending) {
+            this.doSend();
+        }
 
         setButtonAction("button-start", null);
         setButtonAction("button-stop", () => this.stopSending());
     }
 
     stopSending() {
-        if (this._sendCallback !== null) {
-            window.clearTimeout(this._sendCallback);
-            this._sendCallback = null;
+        if (this._stopSending) {
+            this._stopSending();
         }
+
         setButtonAction("button-start", () => this.startSending());
         setButtonAction("button-stop", null);
     }
 
 
-    onRoomEvent(ev, room, toStartOfTimeline) {
+    onRoomEvent(ev, room, toStartOfTimeline, removed, data) {
         console.log("room event", arguments);
+        if (removed || toStartOfTimeline) {
+            return;
+        }
         if (ev.getType() == "m.room.message") {
-            addOutput(room.name + ": " + ev.getContent().body);
+            addOutput(room.name + ": " + ev.sender.name + ": " +
+                ev.getContent().body);
         }
     }
 
     doSend() {
-        this._sendCallback = null;
+        var stopped = false;
+        this._stopSending = function() {
+            stopped = true;
+            this._stopSending = null;
+        }
+
         console.log("send");
         this._matrixClient.sendTextMessage(this._roomId,
             "test " + (this._msgCounter++)
-        ).catch(showError).done();
-
-        this._sendCallback = window.setTimeout(
-            this.doSend, Math.random() * 1000
-        );
+        ).catch(showError).then(() => {
+            // reload once every 10 messages
+            if (Math.random() < 0.1) {
+                console.log("reload");
+                window.location.reload(false);
+                return;
+            }
+        }).delay(Math.random() * 10000).then(() => {
+            if (stopped) { return; }
+            this.doSend();
+        }).done();
     }
 }
 
