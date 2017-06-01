@@ -2,14 +2,24 @@
 (function (global){
 var matrixcs = require("./lib/matrix");
 matrixcs.request(require("browser-request"));
+
+matrixcs.setCryptoStoreFactory(
+    function() {
+        return new matrixcs.IndexedDBCryptoStore(
+            global.indexedDB, "matrix-js-sdk:crypto"
+        );
+    }
+);
+
 module.exports = matrixcs; // keep export for browserify package deps
 global.matrixcs = matrixcs;
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"./lib/matrix":17,"browser-request":39}],2:[function(require,module,exports){
+},{"./lib/matrix":20,"browser-request":47}],2:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -129,18 +139,39 @@ MatrixBaseApis.prototype.makeTxnId = function () {
 // =============================
 
 /**
+ * Check whether a username is available prior to registration. An error response
+ * indicates an invalid/unavailable username.
+ * @param {string} username The username to check the availability of.
+ * @return {module:client.Promise} Resolves: to `true`.
+ */
+MatrixBaseApis.prototype.isUsernameAvailable = function (username) {
+    return this._http.authedRequest(undefined, "GET", '/register/available', { username: username }).then(function (response) {
+        return response.available;
+    });
+};
+
+/**
  * @param {string} username
  * @param {string} password
  * @param {string} sessionId
  * @param {Object} auth
- * @param {boolean} bindEmail
+ * @param {Object} bindThreepids Set key 'email' to true to bind any email
+ *     threepid uses during registration in the ID server. Set 'msisdn' to
+ *     true to bind msisdn.
  * @param {string} guestAccessToken
  * @param {module:client.callback} callback Optional.
  * @return {module:client.Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
-MatrixBaseApis.prototype.register = function (username, password, sessionId, auth, bindEmail, guestAccessToken, callback) {
-    if (auth === undefined) {
+MatrixBaseApis.prototype.register = function (username, password, sessionId, auth, bindThreepids, guestAccessToken, callback) {
+    // backwards compat
+    if (bindThreepids === true) {
+        bindThreepids = { email: true };
+    } else if (bindThreepids === null || bindThreepids === undefined) {
+        bindThreepids = {};
+    }
+
+    if (auth === undefined || auth === null) {
         auth = {};
     }
     if (sessionId) {
@@ -156,11 +187,23 @@ MatrixBaseApis.prototype.register = function (username, password, sessionId, aut
     if (password !== undefined && password !== null) {
         params.password = password;
     }
-    if (bindEmail !== undefined && bindEmail !== null) {
-        params.bind_email = bindEmail;
+    if (bindThreepids.email) {
+        params.bind_email = true;
+    }
+    if (bindThreepids.msisdn) {
+        params.bind_msisdn = true;
     }
     if (guestAccessToken !== undefined && guestAccessToken !== null) {
         params.guest_access_token = guestAccessToken;
+    }
+    // Temporary parameter added to make the register endpoint advertise
+    // msisdn flows. This exists because there are clients that break
+    // when given stages they don't recognise. This parameter will cease
+    // to be necessary once these old clients are gone.
+    // Only send it if we send any params at all (the password param is
+    // mandatory, so if we send any params, we'll send the password param)
+    if (password !== undefined && password !== null) {
+        params.x_show_msisdn = true;
     }
 
     return this.registerRequest(params, undefined, callback);
@@ -431,6 +474,31 @@ MatrixBaseApis.prototype.roomInitialSync = function (roomId, limit, callback) {
         limit = 30;
     }
     return this._http.authedRequest(callback, "GET", path, { limit: limit });
+};
+
+/**
+ * Set a marker to indicate the point in a room before which the user has read every
+ * event. This can be retrieved from room account data (the event type is `m.fully_read`)
+ * and displayed as a horizontal line in the timeline that is visually distinct to the
+ * position of the user's own read receipt.
+ * @param {string} roomId ID of the room that has been read
+ * @param {string} rmEventId ID of the event that has been read
+ * @param {string} rrEventId ID of the event tracked by the read receipt. This is here
+ * for convenience because the RR and the RM are commonly updated at the same time as
+ * each other. Optional.
+ * @return {module:client.Promise} Resolves: the empty object, {}.
+ */
+MatrixBaseApis.prototype.setRoomReadMarkersHttpRequest = function (roomId, rmEventId, rrEventId) {
+    var path = utils.encodeUri("/rooms/$roomId/read_markers", {
+        $roomId: roomId
+    });
+
+    var content = {
+        "m.fully_read": rmEventId,
+        "m.read": rrEventId
+    };
+
+    return this._http.authedRequest(undefined, "POST", path, undefined, content);
 };
 
 // Room Directory operations
@@ -943,19 +1011,32 @@ MatrixBaseApis.prototype.uploadKeysRequest = function (content, opts, callback) 
  *
  * @param {string[]} userIds  list of users to get keys for
  *
- * @param {module:client.callback=} callback
+ * @param {Object=} opts
+ *
+ * @param {string=} opts.token   sync token to pass in the query request, to help
+ *   the HS give the most recent results
  *
  * @return {module:client.Promise} Resolves: result object. Rejects: with
  *     an error response ({@link module:http-api.MatrixError}).
  */
-MatrixBaseApis.prototype.downloadKeysForUsers = function (userIds, callback) {
-    var downloadQuery = {};
-
-    for (var i = 0; i < userIds.length; ++i) {
-        downloadQuery[userIds[i]] = {};
+MatrixBaseApis.prototype.downloadKeysForUsers = function (userIds, opts) {
+    if (utils.isFunction(opts)) {
+        // opts used to be 'callback'.
+        throw new Error('downloadKeysForUsers no longer accepts a callback parameter');
     }
-    var content = { device_keys: downloadQuery };
-    return this._http.authedRequestWithPrefix(callback, "POST", "/keys/query", undefined, content, httpApi.PREFIX_UNSTABLE);
+    opts = opts || {};
+
+    var content = {
+        device_keys: {}
+    };
+    if ('token' in opts) {
+        content.token = opts.token;
+    }
+    userIds.forEach(function (u) {
+        content.device_keys[u] = {};
+    });
+
+    return this._http.authedRequestWithPrefix(undefined, "POST", "/keys/query", undefined, content, httpApi.PREFIX_UNSTABLE);
 };
 
 /**
@@ -984,6 +1065,25 @@ MatrixBaseApis.prototype.claimOneTimeKeys = function (devices, key_algorithm) {
     }
     var content = { one_time_keys: queries };
     return this._http.authedRequestWithPrefix(undefined, "POST", "/keys/claim", undefined, content, httpApi.PREFIX_UNSTABLE);
+};
+
+/**
+ * Ask the server for a list of users who have changed their device lists
+ * between a pair of sync tokens
+ *
+ * @param {string} oldToken
+ * @param {string} newToken
+ *
+ * @return {module:client.Promise} Resolves: result object. Rejects: with
+ *     an error response ({@link module:http-api.MatrixError}).
+ */
+MatrixBaseApis.prototype.getKeyChanges = function (oldToken, newToken) {
+    var qps = {
+        from: oldToken,
+        to: newToken
+    };
+
+    return this._http.authedRequestWithPrefix(undefined, "GET", "/keys/changes", qps, undefined, httpApi.PREFIX_UNSTABLE);
 };
 
 // Identity Server Operations
@@ -1017,6 +1117,32 @@ MatrixBaseApis.prototype.requestEmailToken = function (email, clientSecret, send
         next_link: nextLink
     };
     return this._http.idServerRequest(callback, "POST", "/validate/email/requestToken", params, httpApi.PREFIX_IDENTITY_V1);
+};
+
+/**
+ * Submits an MSISDN token to the identity server
+ *
+ * This is used when submitting the code sent by SMS to a phone number.
+ * The ID server has an equivalent API for email but the js-sdk does
+ * not expose this, since email is normally validated by the user clicking
+ * a link rather than entering a code.
+ *
+ * @param {string} sid The sid given in the response to requestToken
+ * @param {string} clientSecret A secret binary string generated by the client.
+ *                 This must be the same value submitted in the requestToken call.
+ * @param {string} token The token, as enetered by the user.
+ *
+ * @return {module:client.Promise} Resolves: Object, currently with no parameters.
+ * @return {module:http-api.MatrixError} Rejects: with an error response.
+ * @throws Error if No ID server is set
+ */
+MatrixBaseApis.prototype.submitMsisdnToken = function (sid, clientSecret, token) {
+    var params = {
+        sid: sid,
+        client_secret: clientSecret,
+        token: token
+    };
+    return this._http.idServerRequest(undefined, "POST", "/validate/msisdn/submitToken", params, httpApi.PREFIX_IDENTITY_V1);
 };
 
 /**
@@ -1097,10 +1223,11 @@ MatrixBaseApis.prototype.getThirdpartyLocation = function (protocol, params) {
  */
 module.exports = MatrixBaseApis;
 
-},{"./http-api":15,"./utils":36}],3:[function(require,module,exports){
+},{"./http-api":18,"./utils":44}],3:[function(require,module,exports){
 (function (global){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -1115,8 +1242,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 "use strict";
-
-var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
 
 var PushProcessor = require('./pushprocessor');
 
@@ -1149,8 +1274,7 @@ try {
     var Crypto = require("./crypto");
     CRYPTO_ENABLED = true;
 } catch (e) {
-    console.error("olm load error", e);
-    // Olm not installed.
+    console.warn("Unable to load crypto module: crypto will be disabled: " + e);
 }
 
 /**
@@ -1206,10 +1330,11 @@ try {
  * disabled by default for compatibility with older clients - in particular to
  * maintain support for back-paginating the live timeline after a '/sync'
  * result with a gap.
+ *
+ * @param {module:crypto.store.base~CryptoStore} opts.cryptoStore
+ *    crypto store implementation.
  */
 function MatrixClient(opts) {
-    var _this = this;
-
     MatrixBaseApis.call(this, opts);
 
     this.store = opts.store || new StubStore();
@@ -1223,16 +1348,14 @@ function MatrixClient(opts) {
 
     this.scheduler = opts.scheduler;
     if (this.scheduler) {
-        (function () {
-            var self = _this;
-            _this.scheduler.setProcessFunction(function (eventToSend) {
-                var room = self.getRoom(eventToSend.getRoomId());
-                if (eventToSend.status !== EventStatus.SENDING) {
-                    _updatePendingEventStatus(room, eventToSend, EventStatus.SENDING);
-                }
-                return _sendEventHttpRequest(self, eventToSend);
-            });
-        })();
+        var self = this;
+        this.scheduler.setProcessFunction(function (eventToSend) {
+            var room = self.getRoom(eventToSend.getRoomId());
+            if (eventToSend.status !== EventStatus.SENDING) {
+                _updatePendingEventStatus(room, eventToSend, EventStatus.SENDING);
+            }
+            return _sendEventHttpRequest(self, eventToSend);
+        });
     }
     this.clientRunning = false;
 
@@ -1258,14 +1381,46 @@ function MatrixClient(opts) {
     this._notifTimelineSet = null;
 
     this._crypto = null;
-    if (CRYPTO_ENABLED && Boolean(opts.sessionStore) && userId !== null && this.deviceId !== null) {
-        this._crypto = new Crypto(this, this, opts.sessionStore, userId, this.deviceId);
+    this._cryptoStore = opts.cryptoStore;
+    if (CRYPTO_ENABLED && Boolean(opts.sessionStore) && Boolean(this._cryptoStore) && userId !== null && this.deviceId !== null) {
+        this._crypto = new Crypto(this, this, opts.sessionStore, userId, this.deviceId, this.store, opts.cryptoStore);
 
         this.olmVersion = Crypto.getOlmVersion();
     }
 }
 utils.inherits(MatrixClient, EventEmitter);
 utils.extend(MatrixClient.prototype, MatrixBaseApis.prototype);
+
+/**
+ * Clear any data out of the persistent stores used by the client.
+ *
+ * @returns {Promise} Promise which resolves when the stores have been cleared.
+ */
+MatrixClient.prototype.clearStores = function () {
+    if (this._clientRunning) {
+        throw new Error("Cannot clear stores while client is running");
+    }
+
+    var promises = [];
+
+    promises.push(this.store.deleteAllData());
+    if (this._cryptoStore) {
+        promises.push(this._cryptoStore.deleteAllData());
+    }
+    return q.all(promises);
+};
+
+/**
+ * Get the user-id of the logged-in user
+ *
+ * @return {?string} MXID for the logged-in user, or null if not logged in
+ */
+MatrixClient.prototype.getUserId = function () {
+    if (this.credentials && this.credentials.userId) {
+        return this.credentials.userId;
+    }
+    return null;
+};
 
 /**
  * Get the domain for this client's MXID
@@ -1398,17 +1553,15 @@ MatrixClient.prototype.getDeviceEd25519Key = function () {
 };
 
 /**
- * Upload the device keys to the homeserver and ensure that the
- * homeserver has enough one-time keys.
- * @param {number} maxKeys The maximum number of keys to generate
+ * Upload the device keys to the homeserver.
  * @return {object} A promise that will resolve when the keys are uploaded.
  */
-MatrixClient.prototype.uploadKeys = function (maxKeys) {
+MatrixClient.prototype.uploadKeys = function () {
     if (this._crypto === null) {
         throw new Error("End-to-end encryption disabled");
     }
 
-    return this._crypto.uploadKeys(maxKeys);
+    return this._crypto.uploadDeviceKeys();
 };
 
 /**
@@ -1459,6 +1612,21 @@ MatrixClient.prototype.getStoredDevicesForUser = function (userId) {
 };
 
 /**
+ * Get the stored device key for a user id and device id
+ *
+ * @param {string} userId the user to list keys for.
+ * @param {string} deviceId unique identifier for the device
+ *
+ * @return {?module:crypto-deviceinfo} device or null
+ */
+MatrixClient.prototype.getStoredDevice = function (userId, deviceId) {
+    if (this._crypto === null) {
+        throw new Error("End-to-end encryption disabled");
+    }
+    return this._crypto.getStoredDevice(userId, deviceId) || null;
+};
+
+/**
  * Mark the given device as verified
  *
  * @param {string} userId owner of the device
@@ -1494,13 +1662,57 @@ MatrixClient.prototype.setDeviceBlocked = function (userId, deviceId, blocked) {
     _setDeviceVerification(this, userId, deviceId, null, blocked);
 };
 
-function _setDeviceVerification(client, userId, deviceId, verified, blocked) {
+/**
+ * Mark the given device as known/unknown
+ *
+ * @param {string} userId owner of the device
+ * @param {string} deviceId unique identifier for the device
+ *
+ * @param {boolean=} known whether to mark the device as known. defaults
+ *   to 'true'.
+ *
+ * @fires module:client~event:MatrixClient"deviceVerificationChanged"
+ */
+MatrixClient.prototype.setDeviceKnown = function (userId, deviceId, known) {
+    if (known === undefined) {
+        known = true;
+    }
+    _setDeviceVerification(this, userId, deviceId, null, null, known);
+};
+
+function _setDeviceVerification(client, userId, deviceId, verified, blocked, known) {
     if (!client._crypto) {
         throw new Error("End-to-End encryption disabled");
     }
-    client._crypto.setDeviceVerification(userId, deviceId, verified, blocked);
-    client.emit("deviceVerificationChanged", userId, deviceId);
+    var dev = client._crypto.setDeviceVerification(userId, deviceId, verified, blocked, known);
+    client.emit("deviceVerificationChanged", userId, deviceId, dev);
 }
+
+/**
+ * Set the global override for whether the client should ever send encrypted
+ * messages to unverified devices.  If false, it can still be overridden
+ * per-room.  If true, it overrides the per-room settings.
+ *
+ * @param {boolean} value whether to unilaterally blacklist all
+ * unverified devices
+ */
+MatrixClient.prototype.setGlobalBlacklistUnverifiedDevices = function (value) {
+    if (this._crypto === null) {
+        throw new Error("End-to-end encryption disabled");
+    }
+    this._crypto.setGlobalBlacklistUnverifiedDevices(value);
+};
+
+/**
+ * @return {boolean} whether to unilaterally blacklist all
+ * unverified devices
+ */
+MatrixClient.prototype.getGlobalBlacklistUnverifiedDevices = function () {
+    if (this._crypto === null) {
+        throw new Error("End-to-end encryption disabled");
+    }
+    return this._crypto.getGlobalBlacklistUnverifiedDevices();
+};
 
 /**
  * Get e2e information on the device that sent an event
@@ -1602,7 +1814,8 @@ function _decryptEvent(client, event) {
     try {
         client._crypto.decryptEvent(event);
     } catch (e) {
-        if (!(e instanceof Crypto.DecryptionError)) {
+        console.warn("Error decrypting event (id=" + event.getId() + "): " + e);
+        if (e.name !== "DecryptionError") {
             throw e;
         }
         _badEncryptedMessage(event, e.message);
@@ -1998,6 +2211,7 @@ function _sendEvent(client, room, event, callback) {
 
         try {
             _updatePendingEventStatus(room, event, EventStatus.NOT_SENT);
+            event.error = err;
 
             if (callback) {
                 callback(err);
@@ -2223,6 +2437,34 @@ MatrixClient.prototype.sendReadReceipt = function (event, callback) {
 };
 
 /**
+ * Set a marker to indicate the point in a room before which the user has read every
+ * event. This can be retrieved from room account data (the event type is `m.fully_read`)
+ * and displayed as a horizontal line in the timeline that is visually distinct to the
+ * position of the user's own read receipt.
+ * @param {string} roomId ID of the room that has been read
+ * @param {string} eventId ID of the event that has been read
+ * @param {string} rrEvent the event tracked by the read receipt. This is here for
+ * convenience because the RR and the RM are commonly updated at the same time as each
+ * other. The local echo of this receipt will be done if set. Optional.
+ * @return {module:client.Promise} Resolves: the empty object, {}.
+ */
+MatrixClient.prototype.setRoomReadMarkers = function (roomId, eventId, rrEvent) {
+    var rmEventId = eventId;
+    var rrEventId = void 0;
+
+    // Add the optional RR update, do local echo like `sendReceipt`
+    if (rrEvent) {
+        rrEventId = rrEvent.getId();
+        var room = this.getRoom(roomId);
+        if (room) {
+            room._addLocalEchoReceipt(this.credentials.userId, rrEvent, "m.read");
+        }
+    }
+
+    return this.setRoomReadMarkersHttpRequest(roomId, rmEventId, rrEventId);
+};
+
+/**
  * Get a preview of the given URL as of (roughly) the given point in time,
  * described as an object with OpenGraph keys and associated values.
  * Attributes may be synthesized where actual OG metadata is lacking.
@@ -2385,12 +2627,22 @@ MatrixClient.prototype.forget = function (roomId, deleteRoom, callback) {
  * @param {string} roomId
  * @param {string} userId
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {module:client.Promise} Resolves: Object (currently empty)
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.unban = function (roomId, userId, callback) {
-    // unbanning = set their state to leave
-    return _setMembershipState(this, roomId, userId, "leave", undefined, callback);
+    // unbanning != set their state to leave: this used to be
+    // the case, but was then changed so that leaving was always
+    // a revoking of priviledge, otherwise two people racing to
+    // kick / ban someone could end up banning and then un-banning
+    // them.
+    var path = utils.encodeUri("/rooms/$roomId/unban", {
+        $roomId: roomId
+    });
+    var data = {
+        user_id: userId
+    };
+    return this._http.authedRequest(callback, "POST", path, undefined, data);
 };
 
 /**
@@ -3032,11 +3284,38 @@ MatrixClient.prototype.setGuestAccess = function (roomId, opts) {
  * @param {string} clientSecret As requestEmailToken
  * @param {number} sendAttempt As requestEmailToken
  * @param {string} nextLink As requestEmailToken
- * @param {module:client.callback} callback Optional. As requestEmailToken
  * @return {module:client.Promise} Resolves: As requestEmailToken
  */
-MatrixClient.prototype.requestRegisterEmailToken = function (email, clientSecret, sendAttempt, nextLink, callback) {
-    return this._requestTokenFromEndpoint("/register/email/requestToken", email, clientSecret, sendAttempt, nextLink, callback);
+MatrixClient.prototype.requestRegisterEmailToken = function (email, clientSecret, sendAttempt, nextLink) {
+    return this._requestTokenFromEndpoint("/register/email/requestToken", {
+        email: email,
+        client_secret: clientSecret,
+        send_attempt: sendAttempt,
+        next_link: nextLink
+    });
+};
+
+/**
+ * Requests a text message verification token for the purposes of registration.
+ * This API proxies the Identity Server /validate/msisdn/requestToken API,
+ * adding registration-specific behaviour, as with requestRegisterEmailToken.
+ *
+ * @param {string} phoneCountry The ISO 3166-1 alpha-2 code for the country in which
+ *    phoneNumber should be parsed relative to.
+ * @param {string} phoneNumber The phone number, in national or international format
+ * @param {string} clientSecret As requestEmailToken
+ * @param {number} sendAttempt As requestEmailToken
+ * @param {string} nextLink As requestEmailToken
+ * @return {module:client.Promise} Resolves: As requestEmailToken
+ */
+MatrixClient.prototype.requestRegisterMsisdnToken = function (phoneCountry, phoneNumber, clientSecret, sendAttempt, nextLink) {
+    return this._requestTokenFromEndpoint("/register/msisdn/requestToken", {
+        country: phoneCountry,
+        phone_number: phoneNumber,
+        client_secret: clientSecret,
+        send_attempt: sendAttempt,
+        next_link: nextLink
+    });
 };
 
 /**
@@ -3056,11 +3335,39 @@ MatrixClient.prototype.requestRegisterEmailToken = function (email, clientSecret
  * @param {string} clientSecret As requestEmailToken
  * @param {number} sendAttempt As requestEmailToken
  * @param {string} nextLink As requestEmailToken
- * @param {module:client.callback} callback Optional. As requestEmailToken
  * @return {module:client.Promise} Resolves: As requestEmailToken
  */
-MatrixClient.prototype.requestAdd3pidEmailToken = function (email, clientSecret, sendAttempt, nextLink, callback) {
-    return this._requestTokenFromEndpoint("/account/3pid/email/requestToken", email, clientSecret, sendAttempt, nextLink, callback);
+MatrixClient.prototype.requestAdd3pidEmailToken = function (email, clientSecret, sendAttempt, nextLink) {
+    return this._requestTokenFromEndpoint("/account/3pid/email/requestToken", {
+        email: email,
+        client_secret: clientSecret,
+        send_attempt: sendAttempt,
+        next_link: nextLink
+    });
+};
+
+/**
+ * Requests a text message verification token for the purposes of adding a
+ * third party identifier to an account.
+ * This API proxies the Identity Server /validate/email/requestToken API,
+ * adding specific behaviour for the addition of phone numbers to an
+ * account, as requestAdd3pidEmailToken.
+ *
+ * @param {string} phoneCountry As requestRegisterMsisdnToken
+ * @param {string} phoneNumber As requestRegisterMsisdnToken
+ * @param {string} clientSecret As requestEmailToken
+ * @param {number} sendAttempt As requestEmailToken
+ * @param {string} nextLink As requestEmailToken
+ * @return {module:client.Promise} Resolves: As requestEmailToken
+ */
+MatrixClient.prototype.requestAdd3pidMsisdnToken = function (phoneCountry, phoneNumber, clientSecret, sendAttempt, nextLink) {
+    return this._requestTokenFromEndpoint("/account/3pid/msisdn/requestToken", {
+        country: phoneCountry,
+        phone_number: phoneNumber,
+        client_secret: clientSecret,
+        send_attempt: sendAttempt,
+        next_link: nextLink
+    });
 };
 
 /**
@@ -3082,8 +3389,36 @@ MatrixClient.prototype.requestAdd3pidEmailToken = function (email, clientSecret,
  * @param {module:client.callback} callback Optional. As requestEmailToken
  * @return {module:client.Promise} Resolves: As requestEmailToken
  */
-MatrixClient.prototype.requestPasswordEmailToken = function (email, clientSecret, sendAttempt, nextLink, callback) {
-    return this._requestTokenFromEndpoint("/account/password/email/requestToken", email, clientSecret, sendAttempt, nextLink, callback);
+MatrixClient.prototype.requestPasswordEmailToken = function (email, clientSecret, sendAttempt, nextLink) {
+    return this._requestTokenFromEndpoint("/account/password/email/requestToken", {
+        email: email,
+        client_secret: clientSecret,
+        send_attempt: sendAttempt,
+        next_link: nextLink
+    });
+};
+
+/**
+ * Requests a text message verification token for the purposes of resetting
+ * the password on an account.
+ * This API proxies the Identity Server /validate/email/requestToken API,
+ * adding specific behaviour for the password resetting, as requestPasswordEmailToken.
+ *
+ * @param {string} phoneCountry As requestRegisterMsisdnToken
+ * @param {string} phoneNumber As requestRegisterMsisdnToken
+ * @param {string} clientSecret As requestEmailToken
+ * @param {number} sendAttempt As requestEmailToken
+ * @param {string} nextLink As requestEmailToken
+ * @return {module:client.Promise} Resolves: As requestEmailToken
+ */
+MatrixClient.prototype.requestPasswordMsisdnToken = function (phoneCountry, phoneNumber, clientSecret, sendAttempt, nextLink) {
+    return this._requestTokenFromEndpoint("/account/password/msisdn/requestToken", {
+        country: phoneCountry,
+        phone_number: phoneNumber,
+        client_secret: clientSecret,
+        send_attempt: sendAttempt,
+        next_link: nextLink
+    });
 };
 
 /**
@@ -3091,27 +3426,19 @@ MatrixClient.prototype.requestPasswordEmailToken = function (email, clientSecret
  * requestToken endpoints.
  *
  * @param {string} endpoint The endpoint to send the request to
- * @param {string} email As requestEmailToken
- * @param {string} clientSecret As requestEmailToken
- * @param {number} sendAttempt As requestEmailToken
- * @param {string} nextLink As requestEmailToken
- * @param {module:client.callback} callback Optional. As requestEmailToken
+ * @param {object} params Parameters for the POST request
  * @return {module:client.Promise} Resolves: As requestEmailToken
  */
-MatrixClient.prototype._requestTokenFromEndpoint = function (endpoint, email, clientSecret, sendAttempt, nextLink, callback) {
+MatrixClient.prototype._requestTokenFromEndpoint = function (endpoint, params) {
     var id_server_url = url.parse(this.idBaseUrl);
     if (id_server_url.host === null) {
         throw new Error("Invalid ID server URL: " + this.idBaseUrl);
     }
 
-    var params = {
-        client_secret: clientSecret,
-        email: email,
-        send_attempt: sendAttempt,
-        next_link: nextLink,
+    var postParams = Object.assign({}, params, {
         id_server: id_server_url.host
-    };
-    return this._http.request(callback, "POST", endpoint, undefined, params);
+    });
+    return this._http.request(undefined, "POST", endpoint, undefined, postParams);
 };
 
 // Push operations
@@ -3191,32 +3518,26 @@ MatrixClient.prototype.setRoomMutePushRule = function (scope, roomId, mute) {
     }
 
     if (deferred) {
-        var _ret2 = function () {
-            // Update this.pushRules when the operation completes
-            var ruleRefreshDeferred = q.defer();
-            deferred.done(function () {
-                self.getPushRules().done(function (result) {
-                    self.pushRules = result;
-                    ruleRefreshDeferred.resolve();
-                }, function (err) {
-                    ruleRefreshDeferred.reject(err);
-                });
+        // Update this.pushRules when the operation completes
+        var ruleRefreshDeferred = q.defer();
+        deferred.done(function () {
+            self.getPushRules().done(function (result) {
+                self.pushRules = result;
+                ruleRefreshDeferred.resolve();
             }, function (err) {
-                // Update it even if the previous operation fails. This can help the
-                // app to recover when push settings has been modifed from another client
-                self.getPushRules().done(function (result) {
-                    self.pushRules = result;
-                    ruleRefreshDeferred.reject(err);
-                }, function (err2) {
-                    ruleRefreshDeferred.reject(err);
-                });
+                ruleRefreshDeferred.reject(err);
             });
-            return {
-                v: ruleRefreshDeferred.promise
-            };
-        }();
-
-        if ((typeof _ret2 === "undefined" ? "undefined" : _typeof(_ret2)) === "object") return _ret2.v;
+        }, function (err) {
+            // Update it even if the previous operation fails. This can help the
+            // app to recover when push settings has been modifed from another client
+            self.getPushRules().done(function (result) {
+                self.pushRules = result;
+                ruleRefreshDeferred.reject(err);
+            }, function (err2) {
+                ruleRefreshDeferred.reject(err);
+            });
+        });
+        return ruleRefreshDeferred.promise;
     }
 };
 
@@ -3234,13 +3555,18 @@ MatrixClient.prototype.setRoomMutePushRule = function (scope, roomId, mute) {
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.searchMessageText = function (opts, callback) {
+    var roomEvents = {
+        search_term: opts.query
+    };
+
+    if ('keys' in opts) {
+        roomEvents.keys = opts.keys;
+    }
+
     return this.search({
         body: {
             search_categories: {
-                room_events: {
-                    keys: opts.keys,
-                    search_term: opts.query
-                }
+                room_events: roomEvents
             }
         }
     }, callback);
@@ -3556,10 +3882,10 @@ MatrixClient.prototype.getTurnServers = function () {
 
 
 /**
- * High level helper method to call initialSync, emit the resulting events,
- * and then start polling the eventStream for new events. To listen for these
+ * High level helper method to begin syncing and poll for new events. To listen for these
  * events, add a listener for {@link module:client~MatrixClient#event:"event"}
- * via {@link module:client~MatrixClient#on}.
+ * via {@link module:client~MatrixClient#on}. Alternatively, listen for specific
+ * state change events.
  * @param {Object=} opts Options to apply when syncing.
  * @param {Number=} opts.initialSyncLimit The event <code>limit=</code> to apply
  * to initial sync. Default: 8.
@@ -3576,14 +3902,14 @@ MatrixClient.prototype.getTurnServers = function () {
  * accessbile via {@link module:models/room#getPendingEvents}. Default:
  * "chronological".
  *
- * @param {Number=} opts.pollTimeout The number of milliseconds to wait on /events.
+ * @param {Number=} opts.pollTimeout The number of milliseconds to wait on /sync.
  * Default: 30000 (30 seconds).
  *
  * @param {Filter=} opts.filter The filter to apply to /sync calls. This will override
  * the opts.initialSyncLimit, which would normally result in a timeline limit filter.
  */
 MatrixClient.prototype.startClient = function (opts) {
-    var _this2 = this;
+    var _this = this;
 
     if (this.clientRunning) {
         // client is already running.
@@ -3597,17 +3923,8 @@ MatrixClient.prototype.startClient = function (opts) {
         };
     }
 
-    this._clientOpts = opts;
-
     if (this._crypto) {
-        (function () {
-            _this2._crypto.uploadKeys(5).done();
-            var tenMinutes = 1000 * 60 * 10;
-            var self = _this2;
-            _this2._uploadIntervalID = global.setInterval(function () {
-                self._crypto.uploadKeys(5).done();
-            }, tenMinutes);
-        })();
+        this._crypto.uploadDeviceKeys().done();
     }
 
     // periodically poll for turn servers if we support voip
@@ -3618,6 +3935,19 @@ MatrixClient.prototype.startClient = function (opts) {
         console.error("Still have sync object whilst not running: stopping old one");
         this._syncApi.stop();
     }
+
+    // shallow-copy the opts dict before modifying and storing it
+    opts = Object.assign({}, opts);
+
+    opts.crypto = this._crypto;
+    opts.canResetEntireTimeline = function (roomId) {
+        if (!_this._canResetTimelineCallback) {
+            return false;
+        }
+        return _this._canResetTimelineCallback(roomId);
+    };
+    this._clientOpts = opts;
+
     this._syncApi = new SyncApi(this, opts);
     this._syncApi.sync();
 };
@@ -3633,10 +3963,28 @@ MatrixClient.prototype.stopClient = function () {
         this._syncApi.stop();
         this._syncApi = null;
     }
-    if (this._crypto) {
-        global.clearInterval(this._uploadIntervalID);
-    }
     global.clearTimeout(this._checkTurnServersTimeoutID);
+};
+
+/*
+ * Set a function which is called when /sync returns a 'limited' response.
+ * It is called with a room ID and returns a boolean. It should return 'true' if the SDK
+ * can SAFELY remove events from this room. It may not be safe to remove events if there
+ * are other references to the timelines for this room, e.g because the client is
+ * actively viewing events in this room.
+ * Default: returns false.
+ * @param {Function} cb The callback which will be invoked.
+ */
+MatrixClient.prototype.setCanResetTimelineCallback = function (cb) {
+    this._canResetTimelineCallback = cb;
+};
+
+/**
+ * Get the callback set via `setCanResetTimelineCallback`.
+ * @return {?Function} The callback or null
+ */
+MatrixClient.prototype.getCanResetTimelineCallback = function () {
+    return this._canResetTimelineCallback;
 };
 
 function setupCallEventHandler(client) {
@@ -3652,26 +4000,24 @@ function setupCallEventHandler(client) {
     var isClientPrepared = false;
     client.on("sync", function (state) {
         if (state === "PREPARED") {
-            (function () {
-                isClientPrepared = true;
-                var ignoreCallIds = {}; // Set<String>
-                // inspect the buffer and mark all calls which have been answered
-                // or hung up before passing them to the call event handler.
-                for (var i = callEventBuffer.length - 1; i >= 0; i--) {
-                    var ev = callEventBuffer[i];
-                    if (ev.getType() === "m.call.answer" || ev.getType() === "m.call.hangup") {
-                        ignoreCallIds[ev.getContent().call_id] = "yep";
-                    }
+            isClientPrepared = true;
+            var ignoreCallIds = {}; // Set<String>
+            // inspect the buffer and mark all calls which have been answered
+            // or hung up before passing them to the call event handler.
+            for (var i = callEventBuffer.length - 1; i >= 0; i--) {
+                var ev = callEventBuffer[i];
+                if (ev.getType() === "m.call.answer" || ev.getType() === "m.call.hangup") {
+                    ignoreCallIds[ev.getContent().call_id] = "yep";
                 }
-                // now loop through the buffer chronologically and inject them
-                callEventBuffer.forEach(function (e) {
-                    if (ignoreCallIds[e.getContent().call_id]) {
-                        return;
-                    }
-                    callEventHandler(e);
-                });
-                callEventBuffer = [];
-            })();
+            }
+            // now loop through the buffer chronologically and inject them
+            callEventBuffer.forEach(function (e) {
+                if (ignoreCallIds[e.getContent().call_id]) {
+                    return;
+                }
+                callEventHandler(e);
+            });
+            callEventBuffer = [];
         }
     });
 
@@ -3735,7 +4081,7 @@ function setupCallEventHandler(client) {
             var existingCalls = utils.values(client.callList);
             for (i = 0; i < existingCalls.length; ++i) {
                 var thisCall = existingCalls[i];
-                if (call.room_id === thisCall.room_id && thisCall.direction === 'outbound' && ["wait_local_media", "create_offer", "invite_sent"].indexOf(thisCall.state) !== -1) {
+                if (call.roomId === thisCall.roomId && thisCall.direction === 'outbound' && ["wait_local_media", "create_offer", "invite_sent"].indexOf(thisCall.state) !== -1) {
                     existingCall = thisCall;
                     break;
                 }
@@ -3923,21 +4269,26 @@ module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
 /**
  * Fires whenever the SDK's syncing state is updated. The state can be one of:
  * <ul>
- * <li>PREPARED : The client has synced with the server at least once and is
+ *
+ * <li>PREPARED: The client has synced with the server at least once and is
  * ready for methods to be called on it. This will be immediately followed by
  * a state of SYNCING. <i>This is the equivalent of "syncComplete" in the
  * previous API.</i></li>
+ *
  * <li>SYNCING : The client is currently polling for new events from the server.
  * This will be called <i>after</i> processing latest events from a sync.</li>
+ *
  * <li>ERROR : The client has had a problem syncing with the server. If this is
  * called <i>before</i> PREPARED then there was a problem performing the initial
  * sync. If this is called <i>after</i> PREPARED then there was a problem polling
  * the server for updates. This may be called multiple times even if the state is
  * already ERROR. <i>This is the equivalent of "syncError" in the previous
  * API.</i></li>
- * <li>RECONNECTING: The sync connedtion has dropped, but not in a way that should
- * be considered erroneous.
+ *
+ * <li>RECONNECTING: The sync connection has dropped, but not (yet) in a way that
+ * should be considered erroneous.
  * </li>
+ *
  * <li>STOPPED: The client has stopped syncing with server due to stopClient
  * being called.
  * </li>
@@ -3947,43 +4298,74 @@ module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
  *                                          +---->STOPPED
  *                                          |
  *              +----->PREPARED -------> SYNCING <--+
- *              |        ^                  ^       |
- *              |        |                  |       |
- *              |        |                  V       |
- *   null ------+        |  +-RECONNECTING<-+       |
+ *              |        ^                |  ^      |
+ *              |        |                |  |      |
+ *              |        |                V  |      |
+ *   null ------+        |  +--------RECONNECTING   |
  *              |        |  V                       |
  *              +------->ERROR ---------------------+
  *
  * NB: 'null' will never be emitted by this event.
+ *
  * </pre>
  * Transitions:
  * <ul>
+ *
  * <li><code>null -> PREPARED</code> : Occurs when the initial sync is completed
  * first time. This involves setting up filters and obtaining push rules.
+ *
  * <li><code>null -> ERROR</code> : Occurs when the initial sync failed first time.
+ *
  * <li><code>ERROR -> PREPARED</code> : Occurs when the initial sync succeeds
  * after previously failing.
+ *
  * <li><code>PREPARED -> SYNCING</code> : Occurs immediately after transitioning
  * to PREPARED. Starts listening for live updates rather than catching up.
- * <li><code>SYNCING -> ERROR</code> : Occurs the first time a client cannot perform a
- * live update.
+ *
+ * <li><code>SYNCING -> RECONNECTING</code> : Occurs when the live update fails.
+ *
+ * <li><code>RECONNECTING -> RECONNECTING</code> : Can occur if the update calls
+ * continue to fail, but the keepalive calls (to /versions) succeed.
+ *
+ * <li><code>RECONNECTING -> ERROR</code> : Occurs when the keepalive call also fails
+ *
  * <li><code>ERROR -> SYNCING</code> : Occurs when the client has performed a
  * live update after having previously failed.
- * <li><code>ERROR -> ERROR</code> : Occurs when the client has failed to sync
+ *
+ * <li><code>ERROR -> ERROR</code> : Occurs when the client has failed to keepalive
  * for a second time or more.</li>
+ *
  * <li><code>SYNCING -> SYNCING</code> : Occurs when the client has performed a live
  * update. This is called <i>after</i> processing.</li>
+ *
  * <li><code>* -> STOPPED</code> : Occurs once the client has stopped syncing or
  * trying to sync after stopClient has been called.</li>
  * </ul>
  *
  * @event module:client~MatrixClient#"sync"
+ *
  * @param {string} state An enum representing the syncing state. One of "PREPARED",
  * "SYNCING", "ERROR", "STOPPED".
+ *
  * @param {?string} prevState An enum representing the previous syncing state.
  * One of "PREPARED", "SYNCING", "ERROR", "STOPPED" <b>or null</b>.
+ *
  * @param {?Object} data Data about this transition.
+ *
  * @param {MatrixError} data.err The matrix error if <code>state=ERROR</code>.
+ *
+ * @param {String} data.oldSyncToken The 'since' token passed to /sync.
+ *    <code>null</code> for the first successful sync since this client was
+ *    started. Only present if <code>state=PREPARED</code> or
+ *    <code>state=SYNCING</code>.
+ *
+ * @param {String} data.nextSyncToken The 'next_batch' result from /sync, which
+ *    will become the 'since' token for the next call to /sync. Only present if
+ *    <code>state=PREPARED</code> or <code>state=SYNCING</code>.
+ *
+ * @param {boolean} data.catchingUp True if we are working our way through a
+ *    backlog of events after connecting. Only present if <code>state=SYNCING</code>.
+ *
  * @example
  * matrixClient.on("sync", function(state, prevState, data) {
  *   switch (state) {
@@ -4054,11 +4436,12 @@ module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
  * @event module:client~MatrixClient#"deviceVerificationChanged"
  * @param {string} userId the owner of the verified device
  * @param {string} deviceId the id of the verified device
+ * @param {module:crypto/deviceinfo} deviceInfo updated device information
  */
 
 /**
  * Fires whenever new user-scoped account_data is added.
- * @event module:client~MatrixClient#"Room"
+ * @event module:client~MatrixClient#"accountData"
  * @param {MatrixEvent} event The event describing the account_data just added
  * @example
  * matrixClient.on("accountData", function(event){
@@ -4164,7 +4547,7 @@ module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"./base-apis":2,"./content-repo":4,"./crypto":11,"./filter":14,"./http-api":15,"./models/event":21,"./models/event-timeline":20,"./models/search-result":26,"./pushprocessor":28,"./store/stub":33,"./sync":34,"./utils":36,"./webrtc/call":37,"events":46,"q":42,"url":47}],4:[function(require,module,exports){
+},{"./base-apis":2,"./content-repo":4,"./crypto":12,"./filter":17,"./http-api":18,"./models/event":24,"./models/event-timeline":23,"./models/search-result":29,"./pushprocessor":31,"./store/stub":40,"./sync":42,"./utils":44,"./webrtc/call":45,"events":48,"q":51,"url":55}],4:[function(require,module,exports){
 "use strict";
 
 /*
@@ -4272,7 +4655,763 @@ module.exports = {
     }
 };
 
-},{"./utils":36}],5:[function(require,module,exports){
+},{"./utils":44}],5:[function(require,module,exports){
+/*
+Copyright 2017 Vector Creations Ltd
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+"use strict";
+
+/**
+ * @module crypto/DeviceList
+ *
+ * Manages the list of other users' devices
+ */
+
+Object.defineProperty(exports, "__esModule", {
+    value: true
+});
+
+var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+var _q = require('q');
+
+var _q2 = _interopRequireDefault(_q);
+
+var _deviceinfo = require('./deviceinfo');
+
+var _deviceinfo2 = _interopRequireDefault(_deviceinfo);
+
+var _olmlib = require('./olmlib');
+
+var _olmlib2 = _interopRequireDefault(_olmlib);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+// constants for DeviceList._deviceTrackingStatus
+// const TRACKING_STATUS_NOT_TRACKED = 0;
+var TRACKING_STATUS_PENDING_DOWNLOAD = 1;
+var TRACKING_STATUS_DOWNLOAD_IN_PROGRESS = 2;
+var TRACKING_STATUS_UP_TO_DATE = 3;
+
+/**
+ * @alias module:crypto/DeviceList
+ */
+
+var DeviceList = function () {
+    function DeviceList(baseApis, sessionStore, olmDevice) {
+        _classCallCheck(this, DeviceList);
+
+        this._sessionStore = sessionStore;
+        this._serialiser = new DeviceListUpdateSerialiser(baseApis, sessionStore, olmDevice);
+
+        // which users we are tracking device status for.
+        // userId -> TRACKING_STATUS_*
+        this._deviceTrackingStatus = sessionStore.getEndToEndDeviceTrackingStatus() || {};
+        var _iteratorNormalCompletion = true;
+        var _didIteratorError = false;
+        var _iteratorError = undefined;
+
+        try {
+            for (var _iterator = Object.keys(this._deviceTrackingStatus)[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+                var u = _step.value;
+
+                // if a download was in progress when we got shut down, it isn't any more.
+                if (this._deviceTrackingStatus[u] == TRACKING_STATUS_DOWNLOAD_IN_PROGRESS) {
+                    this._deviceTrackingStatus[u] = TRACKING_STATUS_PENDING_DOWNLOAD;
+                }
+            }
+
+            // userId -> promise
+        } catch (err) {
+            _didIteratorError = true;
+            _iteratorError = err;
+        } finally {
+            try {
+                if (!_iteratorNormalCompletion && _iterator.return) {
+                    _iterator.return();
+                }
+            } finally {
+                if (_didIteratorError) {
+                    throw _iteratorError;
+                }
+            }
+        }
+
+        this._keyDownloadsInProgressByUser = {};
+
+        this.lastKnownSyncToken = null;
+    }
+
+    /**
+     * Download the keys for a list of users and stores the keys in the session
+     * store.
+     * @param {Array} userIds The users to fetch.
+     * @param {bool} forceDownload Always download the keys even if cached.
+     *
+     * @return {Promise} A promise which resolves to a map userId->deviceId->{@link
+     * module:crypto/deviceinfo|DeviceInfo}.
+     */
+
+
+    _createClass(DeviceList, [{
+        key: 'downloadKeys',
+        value: function downloadKeys(userIds, forceDownload) {
+            var _this = this;
+
+            var usersToDownload = [];
+            var promises = [];
+
+            userIds.forEach(function (u) {
+                var trackingStatus = _this._deviceTrackingStatus[u];
+                if (_this._keyDownloadsInProgressByUser[u]) {
+                    // already a key download in progress/queued for this user; its results
+                    // will be good enough for us.
+                    promises.push(_this._keyDownloadsInProgressByUser[u]);
+                } else if (forceDownload || trackingStatus != TRACKING_STATUS_UP_TO_DATE) {
+                    usersToDownload.push(u);
+                }
+            });
+
+            if (usersToDownload.length != 0) {
+                console.log("downloadKeys: downloading for", usersToDownload);
+                var downloadPromise = this._doKeyDownload(usersToDownload);
+                promises.push(downloadPromise);
+            }
+
+            return _q2.default.all(promises).then(function () {
+                return _this._getDevicesFromStore(userIds);
+            });
+        }
+
+        /**
+         * Get the stored device keys for a list of user ids
+         *
+         * @param {string[]} userIds the list of users to list keys for.
+         *
+         * @return {Object} userId->deviceId->{@link module:crypto/deviceinfo|DeviceInfo}.
+         */
+
+    }, {
+        key: '_getDevicesFromStore',
+        value: function _getDevicesFromStore(userIds) {
+            var stored = {};
+            var self = this;
+            userIds.map(function (u) {
+                stored[u] = {};
+                var devices = self.getStoredDevicesForUser(u) || [];
+                devices.map(function (dev) {
+                    stored[u][dev.deviceId] = dev;
+                });
+            });
+            return stored;
+        }
+
+        /**
+         * Get the stored device keys for a user id
+         *
+         * @param {string} userId the user to list keys for.
+         *
+         * @return {module:crypto/deviceinfo[]|null} list of devices, or null if we haven't
+         * managed to get a list of devices for this user yet.
+         */
+
+    }, {
+        key: 'getStoredDevicesForUser',
+        value: function getStoredDevicesForUser(userId) {
+            var devs = this._sessionStore.getEndToEndDevicesForUser(userId);
+            if (!devs) {
+                return null;
+            }
+            var res = [];
+            for (var deviceId in devs) {
+                if (devs.hasOwnProperty(deviceId)) {
+                    res.push(_deviceinfo2.default.fromStorage(devs[deviceId], deviceId));
+                }
+            }
+            return res;
+        }
+
+        /**
+         * Get the stored keys for a single device
+         *
+         * @param {string} userId
+         * @param {string} deviceId
+         *
+         * @return {module:crypto/deviceinfo?} device, or undefined
+         * if we don't know about this device
+         */
+
+    }, {
+        key: 'getStoredDevice',
+        value: function getStoredDevice(userId, deviceId) {
+            var devs = this._sessionStore.getEndToEndDevicesForUser(userId);
+            if (!devs || !devs[deviceId]) {
+                return undefined;
+            }
+            return _deviceinfo2.default.fromStorage(devs[deviceId], deviceId);
+        }
+
+        /**
+         * Find a device by curve25519 identity key
+         *
+         * @param {string} userId     owner of the device
+         * @param {string} algorithm  encryption algorithm
+         * @param {string} senderKey  curve25519 key to match
+         *
+         * @return {module:crypto/deviceinfo?}
+         */
+
+    }, {
+        key: 'getDeviceByIdentityKey',
+        value: function getDeviceByIdentityKey(userId, algorithm, senderKey) {
+            if (algorithm !== _olmlib2.default.OLM_ALGORITHM && algorithm !== _olmlib2.default.MEGOLM_ALGORITHM) {
+                // we only deal in olm keys
+                return null;
+            }
+
+            var devices = this._sessionStore.getEndToEndDevicesForUser(userId);
+            if (!devices) {
+                return null;
+            }
+
+            for (var deviceId in devices) {
+                if (!devices.hasOwnProperty(deviceId)) {
+                    continue;
+                }
+
+                var device = devices[deviceId];
+                for (var keyId in device.keys) {
+                    if (!device.keys.hasOwnProperty(keyId)) {
+                        continue;
+                    }
+                    if (keyId.indexOf("curve25519:") !== 0) {
+                        continue;
+                    }
+                    var deviceKey = device.keys[keyId];
+                    if (deviceKey == senderKey) {
+                        return _deviceinfo2.default.fromStorage(device, deviceId);
+                    }
+                }
+            }
+
+            // doesn't match a known device
+            return null;
+        }
+
+        /**
+         * flag the given user for device-list tracking, if they are not already.
+         *
+         * This will mean that a subsequent call to refreshOutdatedDeviceLists()
+         * will download the device list for the user, and that subsequent calls to
+         * invalidateUserDeviceList will trigger more updates.
+         *
+         * @param {String} userId
+         */
+
+    }, {
+        key: 'startTrackingDeviceList',
+        value: function startTrackingDeviceList(userId) {
+            // sanity-check the userId. This is mostly paranoia, but if synapse
+            // can't parse the userId we give it as an mxid, it 500s the whole
+            // request and we can never update the device lists again (because
+            // the broken userId is always 'invalid' and always included in any
+            // refresh request).
+            // By checking it is at least a string, we can eliminate a class of
+            // silly errors.
+            if (typeof userId !== 'string') {
+                throw new Error('userId must be a string; was ' + userId);
+            }
+            if (!this._deviceTrackingStatus[userId]) {
+                console.log('Now tracking device list for ' + userId);
+                this._deviceTrackingStatus[userId] = TRACKING_STATUS_PENDING_DOWNLOAD;
+            }
+            // we don't yet persist the tracking status, since there may be a lot
+            // of calls; instead we wait for the forthcoming
+            // refreshOutdatedDeviceLists.
+        }
+
+        /**
+         * Mark the cached device list for the given user outdated.
+         *
+         * If we are not tracking this user's devices, we'll do nothing. Otherwise
+         * we flag the user as needing an update.
+         *
+         * This doesn't actually set off an update, so that several users can be
+         * batched together. Call refreshOutdatedDeviceLists() for that.
+         *
+         * @param {String} userId
+         */
+
+    }, {
+        key: 'invalidateUserDeviceList',
+        value: function invalidateUserDeviceList(userId) {
+            if (this._deviceTrackingStatus[userId]) {
+                console.log("Marking device list outdated for", userId);
+                this._deviceTrackingStatus[userId] = TRACKING_STATUS_PENDING_DOWNLOAD;
+            }
+            // we don't yet persist the tracking status, since there may be a lot
+            // of calls; instead we wait for the forthcoming
+            // refreshOutdatedDeviceLists.
+        }
+
+        /**
+         * Mark all tracked device lists as outdated.
+         *
+         * This will flag each user whose devices we are tracking as in need of an
+         * update.
+         */
+
+    }, {
+        key: 'invalidateAllDeviceLists',
+        value: function invalidateAllDeviceLists() {
+            var _iteratorNormalCompletion2 = true;
+            var _didIteratorError2 = false;
+            var _iteratorError2 = undefined;
+
+            try {
+                for (var _iterator2 = Object.keys(this._deviceTrackingStatus)[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+                    var userId = _step2.value;
+
+                    this.invalidateUserDeviceList(userId);
+                }
+            } catch (err) {
+                _didIteratorError2 = true;
+                _iteratorError2 = err;
+            } finally {
+                try {
+                    if (!_iteratorNormalCompletion2 && _iterator2.return) {
+                        _iterator2.return();
+                    }
+                } finally {
+                    if (_didIteratorError2) {
+                        throw _iteratorError2;
+                    }
+                }
+            }
+        }
+
+        /**
+         * If we have users who have outdated device lists, start key downloads for them
+         *
+         * @returns {Promise} which completes when the download completes; normally there
+         *    is no need to wait for this (it's mostly for the unit tests).
+         */
+
+    }, {
+        key: 'refreshOutdatedDeviceLists',
+        value: function refreshOutdatedDeviceLists() {
+            var usersToDownload = [];
+            var _iteratorNormalCompletion3 = true;
+            var _didIteratorError3 = false;
+            var _iteratorError3 = undefined;
+
+            try {
+                for (var _iterator3 = Object.keys(this._deviceTrackingStatus)[Symbol.iterator](), _step3; !(_iteratorNormalCompletion3 = (_step3 = _iterator3.next()).done); _iteratorNormalCompletion3 = true) {
+                    var userId = _step3.value;
+
+                    var stat = this._deviceTrackingStatus[userId];
+                    if (stat == TRACKING_STATUS_PENDING_DOWNLOAD) {
+                        usersToDownload.push(userId);
+                    }
+                }
+            } catch (err) {
+                _didIteratorError3 = true;
+                _iteratorError3 = err;
+            } finally {
+                try {
+                    if (!_iteratorNormalCompletion3 && _iterator3.return) {
+                        _iterator3.return();
+                    }
+                } finally {
+                    if (_didIteratorError3) {
+                        throw _iteratorError3;
+                    }
+                }
+            }
+
+            if (usersToDownload.length == 0) {
+                return;
+            }
+
+            // we didn't persist the tracking status during
+            // invalidateUserDeviceList, so do it now.
+            this._persistDeviceTrackingStatus();
+
+            return this._doKeyDownload(usersToDownload);
+        }
+
+        /**
+         * Fire off download update requests for the given users, and update the
+         * device list tracking status for them, and the
+         * _keyDownloadsInProgressByUser map for them.
+         *
+         * @param {String[]} users  list of userIds
+         *
+         * @return {module:client.Promise} resolves when all the users listed have
+         *     been updated. rejects if there was a problem updating any of the
+         *     users.
+         */
+
+    }, {
+        key: '_doKeyDownload',
+        value: function _doKeyDownload(users) {
+            var _this2 = this;
+
+            if (users.length === 0) {
+                // nothing to do
+                return (0, _q2.default)();
+            }
+
+            var prom = this._serialiser.updateDevicesForUsers(users, this.lastKnownSyncToken).then(function () {
+                finished(true);
+            }, function (e) {
+                console.error('Error downloading keys for ' + users + ":", e);
+                finished(false);
+                throw e;
+            });
+
+            users.forEach(function (u) {
+                _this2._keyDownloadsInProgressByUser[u] = prom;
+                var stat = _this2._deviceTrackingStatus[u];
+                if (stat == TRACKING_STATUS_PENDING_DOWNLOAD) {
+                    _this2._deviceTrackingStatus[u] = TRACKING_STATUS_DOWNLOAD_IN_PROGRESS;
+                }
+            });
+
+            var finished = function finished(success) {
+                users.forEach(function (u) {
+                    // we may have queued up another download request for this user
+                    // since we started this request. If that happens, we should
+                    // ignore the completion of the first one.
+                    if (_this2._keyDownloadsInProgressByUser[u] !== prom) {
+                        console.log('Another update in the queue for', u, '- not marking up-to-date');
+                        return;
+                    }
+                    delete _this2._keyDownloadsInProgressByUser[u];
+                    var stat = _this2._deviceTrackingStatus[u];
+                    if (stat == TRACKING_STATUS_DOWNLOAD_IN_PROGRESS) {
+                        if (success) {
+                            // we didn't get any new invalidations since this download started:
+                            // this user's device list is now up to date.
+                            _this2._deviceTrackingStatus[u] = TRACKING_STATUS_UP_TO_DATE;
+                            console.log("Device list for", u, "now up to date");
+                        } else {
+                            _this2._deviceTrackingStatus[u] = TRACKING_STATUS_PENDING_DOWNLOAD;
+                        }
+                    }
+                });
+                _this2._persistDeviceTrackingStatus();
+            };
+
+            return prom;
+        }
+    }, {
+        key: '_persistDeviceTrackingStatus',
+        value: function _persistDeviceTrackingStatus() {
+            this._sessionStore.storeEndToEndDeviceTrackingStatus(this._deviceTrackingStatus);
+        }
+    }]);
+
+    return DeviceList;
+}();
+
+/**
+ * Serialises updates to device lists
+ *
+ * Ensures that results from /keys/query are not overwritten if a second call
+ * completes *before* an earlier one.
+ *
+ * It currently does this by ensuring only one call to /keys/query happens at a
+ * time (and queuing other requests up).
+ */
+
+
+exports.default = DeviceList;
+
+var DeviceListUpdateSerialiser = function () {
+    function DeviceListUpdateSerialiser(baseApis, sessionStore, olmDevice) {
+        _classCallCheck(this, DeviceListUpdateSerialiser);
+
+        this._baseApis = baseApis;
+        this._sessionStore = sessionStore;
+        this._olmDevice = olmDevice;
+
+        this._downloadInProgress = false;
+
+        // users which are queued for download
+        // userId -> true
+        this._keyDownloadsQueuedByUser = {};
+
+        // deferred which is resolved when the queued users are downloaded.
+        //
+        // non-null indicates that we have users queued for download.
+        this._queuedQueryDeferred = null;
+
+        // sync token to be used for the next query: essentially the
+        // most recent one we know about
+        this._nextSyncToken = null;
+    }
+
+    /**
+     * Make a key query request for the given users
+     *
+     * @param {String[]} users list of user ids
+     *
+     * @param {String} syncToken sync token to pass in the query request, to
+     *     help the HS give the most recent results
+     *
+     * @return {module:client.Promise} resolves when all the users listed have
+     *     been updated. rejects if there was a problem updating any of the
+     *     users.
+     */
+
+
+    _createClass(DeviceListUpdateSerialiser, [{
+        key: 'updateDevicesForUsers',
+        value: function updateDevicesForUsers(users, syncToken) {
+            var _this3 = this;
+
+            users.forEach(function (u) {
+                _this3._keyDownloadsQueuedByUser[u] = true;
+            });
+            this._nextSyncToken = syncToken;
+
+            if (!this._queuedQueryDeferred) {
+                this._queuedQueryDeferred = _q2.default.defer();
+            }
+
+            if (this._downloadInProgress) {
+                // just queue up these users
+                console.log('Queued key download for', users);
+                return this._queuedQueryDeferred.promise;
+            }
+
+            // start a new download.
+            return this._doQueuedQueries();
+        }
+    }, {
+        key: '_doQueuedQueries',
+        value: function _doQueuedQueries() {
+            var _this4 = this;
+
+            if (this._downloadInProgress) {
+                throw new Error("DeviceListUpdateSerialiser._doQueuedQueries called with request active");
+            }
+
+            var downloadUsers = Object.keys(this._keyDownloadsQueuedByUser);
+            this._keyDownloadsQueuedByUser = {};
+            var deferred = this._queuedQueryDeferred;
+            this._queuedQueryDeferred = null;
+
+            console.log('Starting key download for', downloadUsers);
+            this._downloadInProgress = true;
+
+            var opts = {};
+            if (this._nextSyncToken) {
+                opts.token = this._nextSyncToken;
+            }
+
+            this._baseApis.downloadKeysForUsers(downloadUsers, opts).then(function (res) {
+                var dk = res.device_keys || {};
+
+                // do each user in a separate promise, to avoid wedging the CPU
+                // (https://github.com/vector-im/riot-web/issues/3158)
+                //
+                // of course we ought to do this in a web worker or similar, but
+                // this serves as an easy solution for now.
+                var prom = (0, _q2.default)();
+                var _iteratorNormalCompletion4 = true;
+                var _didIteratorError4 = false;
+                var _iteratorError4 = undefined;
+
+                try {
+                    var _loop = function _loop() {
+                        var userId = _step4.value;
+
+                        prom = prom.delay(5).then(function () {
+                            _this4._processQueryResponseForUser(userId, dk[userId]);
+                        });
+                    };
+
+                    for (var _iterator4 = downloadUsers[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
+                        _loop();
+                    }
+                } catch (err) {
+                    _didIteratorError4 = true;
+                    _iteratorError4 = err;
+                } finally {
+                    try {
+                        if (!_iteratorNormalCompletion4 && _iterator4.return) {
+                            _iterator4.return();
+                        }
+                    } finally {
+                        if (_didIteratorError4) {
+                            throw _iteratorError4;
+                        }
+                    }
+                }
+
+                return prom;
+            }).done(function () {
+                console.log('Completed key download for ' + downloadUsers);
+
+                _this4._downloadInProgress = false;
+                deferred.resolve();
+
+                // if we have queued users, fire off another request.
+                if (_this4._queuedQueryDeferred) {
+                    _this4._doQueuedQueries();
+                }
+            }, function (e) {
+                console.warn('Error downloading keys for ' + downloadUsers + ':', e);
+                _this4._downloadInProgressInProgress = false;
+                deferred.reject(e);
+            });
+
+            return deferred.promise;
+        }
+    }, {
+        key: '_processQueryResponseForUser',
+        value: function _processQueryResponseForUser(userId, response) {
+            console.log('got keys for ' + userId + ':', response);
+
+            // map from deviceid -> deviceinfo for this user
+            var userStore = {};
+            var devs = this._sessionStore.getEndToEndDevicesForUser(userId);
+            if (devs) {
+                Object.keys(devs).forEach(function (deviceId) {
+                    var d = _deviceinfo2.default.fromStorage(devs[deviceId], deviceId);
+                    userStore[deviceId] = d;
+                });
+            }
+
+            _updateStoredDeviceKeysForUser(this._olmDevice, userId, userStore, response || {});
+
+            // update the session store
+            var storage = {};
+            Object.keys(userStore).forEach(function (deviceId) {
+                storage[deviceId] = userStore[deviceId].toStorage();
+            });
+
+            this._sessionStore.storeEndToEndDevicesForUser(userId, storage);
+        }
+    }]);
+
+    return DeviceListUpdateSerialiser;
+}();
+
+function _updateStoredDeviceKeysForUser(_olmDevice, userId, userStore, userResult) {
+    var updated = false;
+
+    // remove any devices in the store which aren't in the response
+    for (var deviceId in userStore) {
+        if (!userStore.hasOwnProperty(deviceId)) {
+            continue;
+        }
+
+        if (!(deviceId in userResult)) {
+            console.log("Device " + userId + ":" + deviceId + " has been removed");
+            delete userStore[deviceId];
+            updated = true;
+        }
+    }
+
+    for (var _deviceId in userResult) {
+        if (!userResult.hasOwnProperty(_deviceId)) {
+            continue;
+        }
+
+        var deviceResult = userResult[_deviceId];
+
+        // check that the user_id and device_id in the response object are
+        // correct
+        if (deviceResult.user_id !== userId) {
+            console.warn("Mismatched user_id " + deviceResult.user_id + " in keys from " + userId + ":" + _deviceId);
+            continue;
+        }
+        if (deviceResult.device_id !== _deviceId) {
+            console.warn("Mismatched device_id " + deviceResult.device_id + " in keys from " + userId + ":" + _deviceId);
+            continue;
+        }
+
+        if (_storeDeviceKeys(_olmDevice, userStore, deviceResult)) {
+            updated = true;
+        }
+    }
+
+    return updated;
+}
+
+/*
+ * Process a device in a /query response, and add it to the userStore
+ *
+ * returns true if a change was made, else false
+ */
+function _storeDeviceKeys(_olmDevice, userStore, deviceResult) {
+    if (!deviceResult.keys) {
+        // no keys?
+        return false;
+    }
+
+    var deviceId = deviceResult.device_id;
+    var userId = deviceResult.user_id;
+
+    var signKeyId = "ed25519:" + deviceId;
+    var signKey = deviceResult.keys[signKeyId];
+    if (!signKey) {
+        console.warn("Device " + userId + ":" + deviceId + " has no ed25519 key");
+        return false;
+    }
+
+    var unsigned = deviceResult.unsigned || {};
+
+    try {
+        _olmlib2.default.verifySignature(_olmDevice, deviceResult, userId, deviceId, signKey);
+    } catch (e) {
+        console.warn("Unable to verify signature on device " + userId + ":" + deviceId + ":" + e);
+        return false;
+    }
+
+    // DeviceInfo
+    var deviceStore = void 0;
+
+    if (deviceId in userStore) {
+        // already have this device.
+        deviceStore = userStore[deviceId];
+
+        if (deviceStore.getFingerprint() != signKey) {
+            // this should only happen if the list has been MITMed; we are
+            // best off sticking with the original keys.
+            //
+            // Should we warn the user about it somehow?
+            console.warn("Ed25519 key for device " + userId + ":" + deviceId + " has changed");
+            return false;
+        }
+    } else {
+        userStore[deviceId] = deviceStore = new _deviceinfo2.default(deviceId);
+    }
+
+    deviceStore.keys = deviceResult.keys || {};
+    deviceStore.algorithms = deviceResult.algorithms || [];
+    deviceStore.unsigned = unsigned;
+    return true;
+}
+
+},{"./deviceinfo":11,"./olmlib":13,"q":51}],6:[function(require,module,exports){
 (function (global){
 /*
 Copyright 2016 OpenMarket Ltd
@@ -4297,11 +5436,9 @@ limitations under the License.
  * @module crypto/OlmDevice
  */
 
-var Olm = (typeof window !== "undefined" ? window['Olm'] : typeof global !== "undefined" ? global['Olm'] : null);
+var Olm = global.Olm;
 if (!Olm) {
-    // this happens if we were loaded via browserify and the Olm module was not
-    // loaded.
-    throw new Error("Olm is not defined");
+    throw new Error("global.Olm is not defined");
 }
 var utils = require("../utils");
 
@@ -5063,7 +6200,23 @@ module.exports = OlmDevice;
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"../utils":36}],6:[function(require,module,exports){
+},{"../utils":44}],7:[function(require,module,exports){
+'use strict';
+
+Object.defineProperty(exports, "__esModule", {
+    value: true
+});
+
+var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+exports.registerAlgorithm = registerAlgorithm;
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
 /*
 Copyright 2016 OpenMarket Ltd
 
@@ -5079,15 +6232,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-"use strict";
 
 /**
  * Internal module. Defines the base classes of the encryption implementations
  *
- * @module crypto/algorithms/base
+ * @module
  */
-
-var utils = require("../../utils");
 
 /**
  * map of registered encryption algorithm classes. A map from string to {@link
@@ -5095,7 +6245,7 @@ var utils = require("../../utils");
  *
  * @type {Object.<string, function(new: module:crypto/algorithms/base.EncryptionAlgorithm)>}
  */
-module.exports.ENCRYPTION_CLASSES = {};
+var ENCRYPTION_CLASSES = exports.ENCRYPTION_CLASSES = {};
 
 /**
  * map of registered encryption algorithm classes. Map from string to {@link
@@ -5103,12 +6253,11 @@ module.exports.ENCRYPTION_CLASSES = {};
  *
  * @type {Object.<string, function(new: module:crypto/algorithms/base.DecryptionAlgorithm)>}
  */
-module.exports.DECRYPTION_CLASSES = {};
+var DECRYPTION_CLASSES = exports.DECRYPTION_CLASSES = {};
 
 /**
  * base type for encryption implementations
  *
- * @constructor
  * @alias module:crypto/algorithms/base.EncryptionAlgorithm
  *
  * @param {object} params parameters
@@ -5120,43 +6269,55 @@ module.exports.DECRYPTION_CLASSES = {};
  * @param {string} params.roomId  The ID of the room we will be sending to
  * @param {object} params.config  The body of the m.room.encryption event
  */
-var EncryptionAlgorithm = function EncryptionAlgorithm(params) {
-  this._userId = params.userId;
-  this._deviceId = params.deviceId;
-  this._crypto = params.crypto;
-  this._olmDevice = params.olmDevice;
-  this._baseApis = params.baseApis;
-  this._roomId = params.roomId;
-};
-/** */
-module.exports.EncryptionAlgorithm = EncryptionAlgorithm;
 
-/**
- * Encrypt a message event
- *
- * @method module:crypto/algorithms/base.EncryptionAlgorithm#encryptMessage
- * @abstract
- *
- * @param {module:models/room} room
- * @param {string} eventType
- * @param {object} plaintext event content
- *
- * @return {module:client.Promise} Promise which resolves to the new event body
- */
+var EncryptionAlgorithm = function () {
+    function EncryptionAlgorithm(params) {
+        _classCallCheck(this, EncryptionAlgorithm);
 
-/**
- * Called when the membership of a member of the room changes.
- *
- * @param {module:models/event.MatrixEvent} event  event causing the change
- * @param {module:models/room-member} member  user whose membership changed
- * @param {string=} oldMembership  previous membership
- */
-EncryptionAlgorithm.prototype.onRoomMembership = function (event, member, oldMembership) {};
+        this._userId = params.userId;
+        this._deviceId = params.deviceId;
+        this._crypto = params.crypto;
+        this._olmDevice = params.olmDevice;
+        this._baseApis = params.baseApis;
+        this._roomId = params.roomId;
+    }
+
+    /**
+     * Encrypt a message event
+     *
+     * @method module:crypto/algorithms/base.EncryptionAlgorithm.encryptMessage
+     * @abstract
+     *
+     * @param {module:models/room} room
+     * @param {string} eventType
+     * @param {object} plaintext event content
+     *
+     * @return {module:client.Promise} Promise which resolves to the new event body
+     */
+
+    /**
+     * Called when the membership of a member of the room changes.
+     *
+     * @param {module:models/event.MatrixEvent} event  event causing the change
+     * @param {module:models/room-member} member  user whose membership changed
+     * @param {string=} oldMembership  previous membership
+     * @public
+     */
+
+
+    _createClass(EncryptionAlgorithm, [{
+        key: 'onRoomMembership',
+        value: function onRoomMembership(event, member, oldMembership) {}
+    }]);
+
+    return EncryptionAlgorithm;
+}();
+
+exports.EncryptionAlgorithm = EncryptionAlgorithm; // https://github.com/jsdoc3/jsdoc/issues/1272
 
 /**
  * base type for decryption implementations
  *
- * @constructor
  * @alias module:crypto/algorithms/base.DecryptionAlgorithm
  *
  * @param {object} params parameters
@@ -5166,61 +6327,146 @@ EncryptionAlgorithm.prototype.onRoomMembership = function (event, member, oldMem
  * @param {string=} params.roomId The ID of the room we will be receiving
  *     from. Null for to-device events.
  */
-var DecryptionAlgorithm = function DecryptionAlgorithm(params) {
-  this._userId = params.userId;
-  this._crypto = params.crypto;
-  this._olmDevice = params.olmDevice;
-  this._roomId = params.roomId;
-};
-/** */
-module.exports.DecryptionAlgorithm = DecryptionAlgorithm;
 
-/**
- * Decrypt an event
- *
- * @method module:crypto/algorithms/base.DecryptionAlgorithm#decryptEvent
- * @abstract
- *
- * @param {object} event raw event
- *
- * @return {null} if the event referred to an unknown megolm session
- * @return {module:crypto.DecryptionResult} decryption result
- *
- * @throws {module:crypto/algorithms/base.DecryptionError} if there is a
- *   problem decrypting the event
- */
+var DecryptionAlgorithm = function () {
+    function DecryptionAlgorithm(params) {
+        _classCallCheck(this, DecryptionAlgorithm);
 
-/**
- * Handle a key event
- *
- * @method module:crypto/algorithms/base.DecryptionAlgorithm#onRoomKeyEvent
- *
- * @param {module:models/event.MatrixEvent} params event key event
- */
-DecryptionAlgorithm.prototype.onRoomKeyEvent = function (params) {
-  // ignore by default
-};
+        this._userId = params.userId;
+        this._crypto = params.crypto;
+        this._olmDevice = params.olmDevice;
+        this._roomId = params.roomId;
+    }
 
-/**
- * Import a room key
- *
- * @param {module:crypto/OlmDevice.MegolmSessionData} session
- */
-DecryptionAlgorithm.prototype.importRoomKey = function (session) {
-  // ignore by default
-};
+    /**
+     * Decrypt an event
+     *
+     * @method module:crypto/algorithms/base.DecryptionAlgorithm#decryptEvent
+     * @abstract
+     *
+     * @param {object} event raw event
+     *
+     * @return {null} if the event referred to an unknown megolm session
+     * @return {module:crypto.DecryptionResult} decryption result
+     *
+     * @throws {module:crypto/algorithms/base.DecryptionError} if there is a
+     *   problem decrypting the event
+     */
+
+    /**
+     * Handle a key event
+     *
+     * @method module:crypto/algorithms/base.DecryptionAlgorithm#onRoomKeyEvent
+     *
+     * @param {module:models/event.MatrixEvent} params event key event
+     */
+
+
+    _createClass(DecryptionAlgorithm, [{
+        key: 'onRoomKeyEvent',
+        value: function onRoomKeyEvent(params) {}
+        // ignore by default
+
+
+        /**
+         * Import a room key
+         *
+         * @param {module:crypto/OlmDevice.MegolmSessionData} session
+         */
+
+    }, {
+        key: 'importRoomKey',
+        value: function importRoomKey(session) {
+            // ignore by default
+        }
+    }]);
+
+    return DecryptionAlgorithm;
+}();
+
+exports.DecryptionAlgorithm = DecryptionAlgorithm; // https://github.com/jsdoc3/jsdoc/issues/1272
 
 /**
  * Exception thrown when decryption fails
  *
- * @constructor
- * @param {string} msg message describing the problem
+ * @alias module:crypto/algorithms/base.DecryptionError
+ * @param {string} msg user-visible message describing the problem
+ *
+ * @param {Object=} details key/value pairs reported in the logs but not shown
+ *   to the user.
+ *
  * @extends Error
  */
-module.exports.DecryptionError = function (msg) {
-  this.message = msg;
-};
-utils.inherits(module.exports.DecryptionError, Error);
+
+var DecryptionError = function (_Error) {
+    _inherits(DecryptionError, _Error);
+
+    function DecryptionError(msg, details) {
+        _classCallCheck(this, DecryptionError);
+
+        var _this = _possibleConstructorReturn(this, (DecryptionError.__proto__ || Object.getPrototypeOf(DecryptionError)).call(this, msg));
+
+        _this.name = 'DecryptionError';
+        _this.details = details;
+        return _this;
+    }
+
+    /**
+     * override the string used when logging
+     *
+     * @returns {String}
+     */
+
+
+    _createClass(DecryptionError, [{
+        key: 'toString',
+        value: function toString() {
+            var _this2 = this;
+
+            var result = this.name + '[msg: ' + this.message;
+
+            if (this.details) {
+                result += ', ' + Object.keys(this.details).map(function (k) {
+                    return k + ': ' + _this2.details[k];
+                }).join(', ');
+            }
+
+            result += ']';
+
+            return result;
+        }
+    }]);
+
+    return DecryptionError;
+}(Error);
+
+exports.DecryptionError = DecryptionError; // https://github.com/jsdoc3/jsdoc/issues/1272
+
+/**
+ * Exception thrown specifically when we want to warn the user to consider
+ * the security of their conversation before continuing
+ *
+ * @param {string} msg message describing the problem
+ * @param {Object} devices userId -> {deviceId -> object}
+ *      set of unknown devices per user we're warning about
+ * @extends Error
+ */
+
+var UnknownDeviceError = exports.UnknownDeviceError = function (_Error2) {
+    _inherits(UnknownDeviceError, _Error2);
+
+    function UnknownDeviceError(msg, devices) {
+        _classCallCheck(this, UnknownDeviceError);
+
+        var _this3 = _possibleConstructorReturn(this, (UnknownDeviceError.__proto__ || Object.getPrototypeOf(UnknownDeviceError)).call(this, msg));
+
+        _this3.name = "UnknownDeviceError";
+        _this3.devices = devices;
+        return _this3;
+    }
+
+    return UnknownDeviceError;
+}(Error);
 
 /**
  * Registers an encryption/decryption class for a particular algorithm
@@ -5235,12 +6481,14 @@ utils.inherits(module.exports.DecryptionError, Error);
  *     module:crypto/algorithms/base.DecryptionAlgorithm|DecryptionAlgorithm}
  *     implementation
  */
-module.exports.registerAlgorithm = function (algorithm, encryptor, decryptor) {
-  module.exports.ENCRYPTION_CLASSES[algorithm] = encryptor;
-  module.exports.DECRYPTION_CLASSES[algorithm] = decryptor;
-};
 
-},{"../../utils":36}],7:[function(require,module,exports){
+
+function registerAlgorithm(algorithm, encryptor, decryptor) {
+    ENCRYPTION_CLASSES[algorithm] = encryptor;
+    DECRYPTION_CLASSES[algorithm] = decryptor;
+}
+
+},{}],8:[function(require,module,exports){
 /*
 Copyright 2016 OpenMarket Ltd
 
@@ -5282,7 +6530,7 @@ module.exports.DECRYPTION_CLASSES = base.DECRYPTION_CLASSES;
  */
 module.exports.DecryptionError = base.DecryptionError;
 
-},{"./base":6,"./megolm":8,"./olm":9}],8:[function(require,module,exports){
+},{"./base":7,"./megolm":9,"./olm":10}],9:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -5635,6 +6883,10 @@ MegolmEncryption.prototype._shareKeyWithDevices = function (session, devicesByUs
 MegolmEncryption.prototype.encryptMessage = function (room, eventType, content) {
     var self = this;
     return this._getDevicesInRoom(room).then(function (devicesInRoom) {
+        // check if any of these devices are not yet known to the user.
+        // if so, warn the user so they can verify or ignore.
+        self._checkForUnknownDevices(devicesInRoom);
+
         return self._ensureOutboundSession(devicesInRoom);
     }).then(function (session) {
         var payloadJson = {
@@ -5661,6 +6913,35 @@ MegolmEncryption.prototype.encryptMessage = function (room, eventType, content) 
 };
 
 /**
+ * Checks the devices we're about to send to and see if any are entirely
+ * unknown to the user.  If so, warn the user, and mark them as known to
+ * give the user a chance to go verify them before re-sending this message.
+ *
+ * @param {Object} devicesInRoom userId -> {deviceId -> object}
+ *   devices we should shared the session with.
+ */
+MegolmEncryption.prototype._checkForUnknownDevices = function (devicesInRoom) {
+    var unknownDevices = {};
+
+    Object.keys(devicesInRoom).forEach(function (userId) {
+        Object.keys(devicesInRoom[userId]).forEach(function (deviceId) {
+            var device = devicesInRoom[userId][deviceId];
+            if (device.isUnverified() && !device.isKnown()) {
+                if (!unknownDevices[userId]) {
+                    unknownDevices[userId] = {};
+                }
+                unknownDevices[userId][deviceId] = device;
+            }
+        });
+    });
+
+    if (Object.keys(unknownDevices).length) {
+        // it'd be kind to pass unknownDevices up to the user in this error
+        throw new base.UnknownDeviceError("This room contains unknown devices which have not been verified. " + "We strongly recommend you verify them before continuing.", unknownDevices);
+    }
+};
+
+/**
  * Get the list of unblocked devices for all users in the room
  *
  * @param {module:models/room} room
@@ -5669,6 +6950,8 @@ MegolmEncryption.prototype.encryptMessage = function (room, eventType, content) 
  *     from userId to deviceId to deviceInfo
  */
 MegolmEncryption.prototype._getDevicesInRoom = function (room) {
+    var _this = this;
+
     // XXX what about rooms where invitees can see the content?
     var roomMembers = utils.map(room.getJoinedMembers(), function (u) {
         return u.userId;
@@ -5678,6 +6961,11 @@ MegolmEncryption.prototype._getDevicesInRoom = function (room) {
     // have a list of the user's devices, then we already share an e2e room
     // with them, which means that they will have announced any new devices via
     // an m.new_device.
+    //
+    // XXX: what if the cache is stale, and the user left the room we had in
+    // common and then added new devices before joining this one? --Matthew
+    //
+    // yup, see https://github.com/vector-im/riot-web/issues/2305 --richvdh
     return this._crypto.downloadKeys(roomMembers, false).then(function (devices) {
         // remove any blocked devices
         for (var userId in devices) {
@@ -5690,7 +6978,8 @@ MegolmEncryption.prototype._getDevicesInRoom = function (room) {
                 if (!userDevices.hasOwnProperty(deviceId)) {
                     continue;
                 }
-                if (userDevices[deviceId].isBlocked()) {
+
+                if (userDevices[deviceId].isBlocked() || userDevices[deviceId].isUnverified() && (room.getBlacklistUnverifiedDevices() || _this._crypto.getGlobalBlacklistUnverifiedDevices())) {
                     delete userDevices[deviceId];
                 }
             }
@@ -5740,13 +7029,17 @@ MegolmDecryption.prototype.decryptEvent = function (event) {
         if (e.message === 'OLM.UNKNOWN_MESSAGE_INDEX') {
             this._addEventToPendingList(event);
         }
-        throw new base.DecryptionError(e);
+        throw new base.DecryptionError(e.toString(), {
+            session: content.sender_key + '|' + content.session_id
+        });
     }
 
     if (res === null) {
         // We've got a message for a session we don't have.
         this._addEventToPendingList(event);
-        throw new base.DecryptionError("The sender's device has not sent us the keys for this message.");
+        throw new base.DecryptionError("The sender's device has not sent us the keys for this message.", {
+            session: content.sender_key + '|' + content.session_id
+        });
     }
 
     var payload = JSON.parse(res.result);
@@ -5784,18 +7077,24 @@ MegolmDecryption.prototype._addEventToPendingList = function (event) {
  * @param {module:models/event.MatrixEvent} event key event
  */
 MegolmDecryption.prototype.onRoomKeyEvent = function (event) {
-    console.log("Adding key from ", event);
     var content = event.getContent();
+    var senderKey = event.getSenderKey();
+    var sessionId = content.session_id;
 
-    if (!content.room_id || !content.session_id || !content.session_key) {
+    if (!content.room_id || !sessionId || !content.session_key) {
         console.error("key event is missing fields");
         return;
     }
+    if (!senderKey) {
+        console.error("key event has no sender key (not encrypted?)");
+        return;
+    }
 
-    this._olmDevice.addInboundGroupSession(content.room_id, event.getSenderKey(), content.session_id, content.session_key, event.getKeysClaimed());
+    console.log("Adding key for megolm session " + senderKey + "|" + sessionId);
+    this._olmDevice.addInboundGroupSession(content.room_id, senderKey, sessionId, content.session_key, event.getKeysClaimed());
 
     // have another go at decrypting events sent with this session.
-    this._retryDecryption(event.getSenderKey, content.session_id);
+    this._retryDecryption(senderKey, sessionId);
 };
 
 /**
@@ -5838,7 +7137,7 @@ MegolmDecryption.prototype._retryDecryption = function (senderKey, sessionId) {
 
 base.registerAlgorithm(olmlib.MEGOLM_ALGORITHM, MegolmEncryption, MegolmDecryption);
 
-},{"../../utils":36,"../olmlib":12,"./base":6,"q":42}],9:[function(require,module,exports){
+},{"../../utils":44,"../olmlib":13,"./base":7,"q":51}],10:[function(require,module,exports){
 /*
 Copyright 2016 OpenMarket Ltd
 
@@ -5905,7 +7204,7 @@ OlmEncryption.prototype._ensureSession = function (roomMembers) {
     }
 
     var self = this;
-    this._prepPromise = self._crypto.downloadKeys(roomMembers, true).then(function (res) {
+    this._prepPromise = self._crypto.downloadKeys(roomMembers).then(function (res) {
         return self._crypto.ensureOlmSessionsForUsers(roomMembers);
     }).then(function () {
         self._sessionPrepared = true;
@@ -6011,8 +7310,10 @@ OlmDecryption.prototype.decryptEvent = function (event) {
     try {
         payloadString = this._decryptMessage(deviceKey, message);
     } catch (e) {
-        console.warn("Failed to decrypt Olm event (id=" + event.getId() + ") from " + deviceKey + ": " + e.message);
-        throw new base.DecryptionError("Bad Encrypted Message");
+        throw new base.DecryptionError("Bad Encrypted Message", {
+            sender: deviceKey,
+            err: e
+        });
     }
 
     var payload = JSON.parse(payloadString);
@@ -6020,13 +7321,14 @@ OlmDecryption.prototype.decryptEvent = function (event) {
     // check that we were the intended recipient, to avoid unknown-key attack
     // https://github.com/vector-im/vector-web/issues/2483
     if (payload.recipient != this._userId) {
-        console.warn("Event " + event.getId() + ": Intended recipient " + payload.recipient + " does not match our id " + this._userId);
         throw new base.DecryptionError("Message was intented for " + payload.recipient);
     }
 
     if (payload.recipient_keys.ed25519 != this._olmDevice.deviceEd25519Key) {
-        console.warn("Event " + event.getId() + ": Intended recipient ed25519 key " + payload.recipient_keys.ed25519 + " did not match ours");
-        throw new base.DecryptionError("Message not intended for this device");
+        throw new base.DecryptionError("Message not intended for this device", {
+            intended: payload.recipient_keys.ed25519,
+            our_key: this._olmDevice.deviceEd25519Key
+        });
     }
 
     // check that the original sender matches what the homeserver told us, to
@@ -6034,14 +7336,16 @@ OlmDecryption.prototype.decryptEvent = function (event) {
     // (this check is also provided via the sender's embedded ed25519 key,
     // which is checked elsewhere).
     if (payload.sender != event.getSender()) {
-        console.warn("Event " + event.getId() + ": original sender " + payload.sender + " does not match reported sender " + event.getSender());
-        throw new base.DecryptionError("Message forwarded from " + payload.sender);
+        throw new base.DecryptionError("Message forwarded from " + payload.sender, {
+            reported_sender: event.getSender()
+        });
     }
 
     // Olm events intended for a room have a room_id.
     if (payload.room_id !== event.getRoomId()) {
-        console.warn("Event " + event.getId() + ": original room " + payload.room_id + " does not match reported room " + event.room_id);
-        throw new base.DecryptionError("Message intended for room " + payload.room_id);
+        throw new base.DecryptionError("Message intended for room " + payload.room_id, {
+            reported_room: event.room_id
+        });
     }
 
     event.setClearData(payload, { curve25519: deviceKey }, payload.keys || {});
@@ -6109,7 +7413,7 @@ OlmDecryption.prototype._decryptMessage = function (theirDeviceIdentityKey, mess
 
 base.registerAlgorithm(olmlib.OLM_ALGORITHM, OlmEncryption, OlmDecryption);
 
-},{"../../utils":36,"../deviceinfo":10,"../olmlib":12,"./base":6,"q":42}],10:[function(require,module,exports){
+},{"../../utils":44,"../deviceinfo":11,"../olmlib":13,"./base":7,"q":51}],11:[function(require,module,exports){
 /*
 Copyright 2016 OpenMarket Ltd
 
@@ -6145,7 +7449,11 @@ limitations under the License.
   *      &lt;key type&gt;:&lt;id&gt; -> &lt;base64-encoded key&gt;>
   *
   * @property {module:crypto/deviceinfo.DeviceVerification} verified
-  *     whether the device has been verified by the user
+  *     whether the device has been verified/blocked by the user
+  *
+  * @property {boolean} known
+  *     whether the user knows of this device's existence (useful when warning
+  *     the user that a user has added new devices)
   *
   * @property {Object} unsigned  additional data from the homeserver
   *
@@ -6162,6 +7470,7 @@ function DeviceInfo(deviceId) {
     this.algorithms = [];
     this.keys = {};
     this.verified = DeviceVerification.UNVERIFIED;
+    this.known = false;
     this.unsigned = {};
 }
 
@@ -6193,6 +7502,7 @@ DeviceInfo.prototype.toStorage = function () {
         algorithms: this.algorithms,
         keys: this.keys,
         verified: this.verified,
+        known: this.known,
         unsigned: this.unsigned
     };
 };
@@ -6243,6 +7553,24 @@ DeviceInfo.prototype.isVerified = function () {
 };
 
 /**
+ * Returns true if this device is unverified
+ *
+ * @return {Boolean} true if unverified
+ */
+DeviceInfo.prototype.isUnverified = function () {
+    return this.verified == DeviceVerification.UNVERIFIED;
+};
+
+/**
+ * Returns true if the user knows about this device's existence
+ *
+ * @return {Boolean} true if known
+ */
+DeviceInfo.prototype.isKnown = function () {
+    return this.known == true;
+};
+
+/**
  * @enum
  */
 DeviceInfo.DeviceVerification = {
@@ -6256,9 +7584,10 @@ var DeviceVerification = DeviceInfo.DeviceVerification;
 /** */
 module.exports = DeviceInfo;
 
-},{}],11:[function(require,module,exports){
+},{}],12:[function(require,module,exports){
 /*
 Copyright 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -6287,6 +7616,7 @@ var olmlib = require("./olmlib");
 var algorithms = require("./algorithms");
 var DeviceInfo = require("./deviceinfo");
 var DeviceVerification = DeviceInfo.DeviceVerification;
+var DeviceList = require('./DeviceList').default;
 
 /**
  * Cryptography bits
@@ -6305,20 +7635,30 @@ var DeviceVerification = DeviceInfo.DeviceVerification;
  * @param {string} userId The user ID for the local user
  *
  * @param {string} deviceId The identifier for this device.
+ *
+ * @param {Object} clientStore the MatrixClient data store.
+ *
+ * @param {module:crypto/store/base~CryptoStore} cryptoStore
+ *    storage for the crypto layer.
  */
-function Crypto(baseApis, eventEmitter, sessionStore, userId, deviceId) {
+function Crypto(baseApis, eventEmitter, sessionStore, userId, deviceId, clientStore, cryptoStore) {
     this._baseApis = baseApis;
     this._sessionStore = sessionStore;
     this._userId = userId;
     this._deviceId = deviceId;
-
-    this._initialSyncCompleted = false;
-    // userId -> true
-    this._pendingUsersWithNewDevices = {};
-    // userId -> [promise, ...]
-    this._keyDownloadsInProgressByUser = {};
+    this._clientStore = clientStore;
+    this._cryptoStore = cryptoStore;
 
     this._olmDevice = new OlmDevice(sessionStore);
+    this._deviceList = new DeviceList(baseApis, sessionStore, this._olmDevice);
+    this._initialDeviceListInvalidationPending = false;
+
+    this._clientRunning = false;
+
+    // the last time we did a check for the number of one-time-keys on the
+    // server.
+    this._lastOneTimeKeyCheck = null;
+    this._oneTimeKeyCheckInProgress = false;
 
     // EncryptionAlgorithm instance for each room
     this._roomEncryptors = {};
@@ -6333,12 +7673,11 @@ function Crypto(baseApis, eventEmitter, sessionStore, userId, deviceId) {
     this._deviceKeys["ed25519:" + this._deviceId] = this._olmDevice.deviceEd25519Key;
     this._deviceKeys["curve25519:" + this._deviceId] = this._olmDevice.deviceCurve25519Key;
 
+    this._globalBlacklistUnverifiedDevices = false;
+
     var myDevices = this._sessionStore.getEndToEndDevicesForUser(this._userId);
 
     if (!myDevices) {
-        // we don't yet have a list of our own devices; make sure we
-        // get one when we flush the pendingUsersWithNewDevices.
-        this._pendingUsersWithNewDevices[this._userId] = true;
         myDevices = {};
     }
 
@@ -6347,7 +7686,8 @@ function Crypto(baseApis, eventEmitter, sessionStore, userId, deviceId) {
         var deviceInfo = {
             keys: this._deviceKeys,
             algorithms: this._supportedAlgorithms,
-            verified: DeviceVerification.VERIFIED
+            verified: DeviceVerification.VERIFIED,
+            known: true
         };
 
         myDevices[this._deviceId] = deviceInfo;
@@ -6360,11 +7700,13 @@ function Crypto(baseApis, eventEmitter, sessionStore, userId, deviceId) {
 function _registerEventHandlers(crypto, eventEmitter) {
     eventEmitter.on("sync", function (syncState, oldState, data) {
         try {
-            if (syncState == "PREPARED") {
-                // XXX ugh. we're assuming the eventEmitter is a MatrixClient.
-                // how can we avoid doing so?
-                var rooms = eventEmitter.getRooms();
-                crypto._onInitialSyncCompleted(rooms);
+            if (syncState === "STOPPED") {
+                crypto._clientRunning = false;
+            } else if (syncState === "PREPARED") {
+                crypto._clientRunning = true;
+            }
+            if (syncState === "SYNCING") {
+                crypto._onSyncCompleted(data);
             }
         } catch (e) {
             console.error("Error handling sync", e);
@@ -6420,61 +7762,30 @@ Crypto.prototype.getDeviceEd25519Key = function () {
 };
 
 /**
- * Upload the device keys to the homeserver and ensure that the
- * homeserver has enough one-time keys.
- * @param {number} maxKeys The maximum number of keys to generate
- * @return {object} A promise that will resolve when the keys are uploaded.
+ * Set the global override for whether the client should ever send encrypted
+ * messages to unverified devices.  If false, it can still be overridden
+ * per-room.  If true, it overrides the per-room settings.
+ *
+ * @param {boolean} value whether to unilaterally blacklist all
+ * unverified devices
  */
-Crypto.prototype.uploadKeys = function (maxKeys) {
-    var self = this;
-    return _uploadDeviceKeys(this).then(function (res) {
-        // We need to keep a pool of one time public keys on the server so that
-        // other devices can start conversations with us. But we can only store
-        // a finite number of private keys in the olm Account object.
-        // To complicate things further then can be a delay between a device
-        // claiming a public one time key from the server and it sending us a
-        // message. We need to keep the corresponding private key locally until
-        // we receive the message.
-        // But that message might never arrive leaving us stuck with duff
-        // private keys clogging up our local storage.
-        // So we need some kind of enginering compromise to balance all of
-        // these factors.
-
-        // We first find how many keys the server has for us.
-        var keyCount = res.one_time_key_counts.signed_curve25519 || 0;
-        // We then check how many keys we can store in the Account object.
-        var maxOneTimeKeys = self._olmDevice.maxNumberOfOneTimeKeys();
-        // Try to keep at most half that number on the server. This leaves the
-        // rest of the slots free to hold keys that have been claimed from the
-        // server but we haven't recevied a message for.
-        // If we run out of slots when generating new keys then olm will
-        // discard the oldest private keys first. This will eventually clean
-        // out stale private keys that won't receive a message.
-        var keyLimit = Math.floor(maxOneTimeKeys / 2);
-        // We work out how many new keys we need to create to top up the server
-        // If there are too many keys on the server then we don't need to
-        // create any more keys.
-        var numberToGenerate = Math.max(keyLimit - keyCount, 0);
-        if (maxKeys !== undefined) {
-            // Creating keys can be an expensive operation so we limit the
-            // number we generate in one go to avoid blocking the application
-            // for too long.
-            numberToGenerate = Math.min(numberToGenerate, maxKeys);
-        }
-
-        if (numberToGenerate <= 0) {
-            // If we don't need to generate any keys then we are done.
-            return;
-        }
-
-        // Ask olm to generate new one time keys, then upload them to synapse.
-        self._olmDevice.generateOneTimeKeys(numberToGenerate);
-        return _uploadOneTimeKeys(self);
-    });
+Crypto.prototype.setGlobalBlacklistUnverifiedDevices = function (value) {
+    this._globalBlacklistUnverifiedDevices = value;
 };
 
-// returns a promise which resolves to the response
-function _uploadDeviceKeys(crypto) {
+/**
+ * @return {boolean} whether to unilaterally blacklist all unverified devices
+ */
+Crypto.prototype.getGlobalBlacklistUnverifiedDevices = function () {
+    return this._globalBlacklistUnverifiedDevices;
+};
+
+/**
+ * Upload the device keys to the homeserver.
+ * @return {object} A promise that will resolve when the keys are uploaded.
+ */
+Crypto.prototype.uploadDeviceKeys = function () {
+    var crypto = this;
     var userId = crypto._userId;
     var deviceId = crypto._deviceId;
 
@@ -6493,6 +7804,88 @@ function _uploadDeviceKeys(crypto) {
         // same one as used in login.
         device_id: deviceId
     });
+};
+
+// check if it's time to upload one-time keys, and do so if so.
+function _maybeUploadOneTimeKeys(crypto) {
+    // frequency with which to check & upload one-time keys
+    var uploadPeriod = 1000 * 60; // one minute
+
+    // max number of keys to upload at once
+    // Creating keys can be an expensive operation so we limit the
+    // number we generate in one go to avoid blocking the application
+    // for too long.
+    var maxKeysPerCycle = 5;
+
+    if (crypto._oneTimeKeyCheckInProgress) {
+        return;
+    }
+
+    var now = Date.now();
+    if (crypto._lastOneTimeKeyCheck !== null && now - crypto._lastOneTimeKeyCheck < uploadPeriod) {
+        // we've done a key upload recently.
+        return;
+    }
+
+    crypto._lastOneTimeKeyCheck = now;
+
+    function uploadLoop(numberToGenerate) {
+        if (numberToGenerate <= 0) {
+            // If we don't need to generate any more keys then we are done.
+            return;
+        }
+
+        var keysThisLoop = Math.min(numberToGenerate, maxKeysPerCycle);
+
+        // Ask olm to generate new one time keys, then upload them to synapse.
+        crypto._olmDevice.generateOneTimeKeys(keysThisLoop);
+        return _uploadOneTimeKeys(crypto).then(function () {
+            return uploadLoop(numberToGenerate - keysThisLoop);
+        });
+    }
+
+    crypto._oneTimeKeyCheckInProgress = true;
+    q().then(function () {
+        // ask the server how many keys we have
+        return crypto._baseApis.uploadKeysRequest({}, {
+            device_id: crypto._deviceId
+        });
+    }).then(function (res) {
+        // We need to keep a pool of one time public keys on the server so that
+        // other devices can start conversations with us. But we can only store
+        // a finite number of private keys in the olm Account object.
+        // To complicate things further then can be a delay between a device
+        // claiming a public one time key from the server and it sending us a
+        // message. We need to keep the corresponding private key locally until
+        // we receive the message.
+        // But that message might never arrive leaving us stuck with duff
+        // private keys clogging up our local storage.
+        // So we need some kind of enginering compromise to balance all of
+        // these factors.
+
+        // We first find how many keys the server has for us.
+        var keyCount = res.one_time_key_counts.signed_curve25519 || 0;
+        // We then check how many keys we can store in the Account object.
+        var maxOneTimeKeys = crypto._olmDevice.maxNumberOfOneTimeKeys();
+        // Try to keep at most half that number on the server. This leaves the
+        // rest of the slots free to hold keys that have been claimed from the
+        // server but we haven't recevied a message for.
+        // If we run out of slots when generating new keys then olm will
+        // discard the oldest private keys first. This will eventually clean
+        // out stale private keys that won't receive a message.
+        var keyLimit = Math.floor(maxOneTimeKeys / 2);
+
+        // We work out how many new keys we need to create to top up the server
+        // If there are too many keys on the server then we don't need to
+        // create any more keys.
+        var numberToGenerate = Math.max(keyLimit - keyCount, 0);
+
+        return uploadLoop(numberToGenerate);
+    }).catch(function (e) {
+        console.error("Error uploading one-time keys", e.stack || e);
+    }).finally(function () {
+        crypto._oneTimeKeyCheckInProgress = false;
+    }).done();
 }
 
 // returns a promise which resolves to the response
@@ -6532,256 +7925,8 @@ function _uploadOneTimeKeys(crypto) {
  * module:crypto/deviceinfo|DeviceInfo}.
  */
 Crypto.prototype.downloadKeys = function (userIds, forceDownload) {
-    var _this = this;
-
-    var self = this;
-
-    // promises we need to wait for while the download happens
-    var promises = [];
-
-    // list of userids we need to download keys for
-    var downloadUsers = [];
-
-    function perUserCatch(u) {
-        return function (e) {
-            console.warn('Error downloading keys for user ' + u + ':', e);
-        };
-    }
-
-    if (forceDownload) {
-        downloadUsers = userIds;
-    } else {
-        for (var i = 0; i < userIds.length; ++i) {
-            var u = userIds[i];
-
-            var inprogress = this._keyDownloadsInProgressByUser[u];
-            if (inprogress) {
-                // wait for the download to complete
-                promises.push(q.any(inprogress).catch(perUserCatch(u)));
-            } else if (!this.getStoredDevicesForUser(u)) {
-                downloadUsers.push(u);
-            }
-        }
-    }
-
-    if (downloadUsers.length > 0) {
-        (function () {
-            var r = _this._doKeyDownloadForUsers(downloadUsers);
-            downloadUsers.map(function (u) {
-                promises.push(r[u].catch(perUserCatch(u)));
-            });
-        })();
-    }
-
-    return q.all(promises).then(function () {
-        return self._getDevicesFromStore(userIds);
-    });
+    return this._deviceList.downloadKeys(userIds, forceDownload);
 };
-
-/**
- * Get the stored device keys for a list of user ids
- *
- * @param {string[]} userIds the list of users to list keys for.
- *
- * @return {Object} userId->deviceId->{@link module:crypto/deviceinfo|DeviceInfo}.
- */
-Crypto.prototype._getDevicesFromStore = function (userIds) {
-    var stored = {};
-    var self = this;
-    userIds.map(function (u) {
-        stored[u] = {};
-        var devices = self.getStoredDevicesForUser(u) || [];
-        devices.map(function (dev) {
-            stored[u][dev.deviceId] = dev;
-        });
-    });
-    return stored;
-};
-
-/**
- * @param {string[]} downloadUsers list of userIds
- *
- * @return {Object} a map from userId to a promise for a result for that user
- */
-Crypto.prototype._doKeyDownloadForUsers = function (downloadUsers) {
-    var self = this;
-
-    console.log('Starting key download for ' + downloadUsers);
-
-    var deferMap = {};
-    var promiseMap = {};
-
-    downloadUsers.map(function (u) {
-        var deferred = q.defer();
-        var promise = deferred.promise.finally(function () {
-            var inProgress = self._keyDownloadsInProgressByUser[u];
-            utils.removeElement(inProgress, function (e) {
-                return e === promise;
-            });
-            if (inProgress.length === 0) {
-                // no more downloads for this user; remove the element
-                delete self._keyDownloadsInProgressByUser[u];
-            }
-        });
-
-        if (!self._keyDownloadsInProgressByUser[u]) {
-            self._keyDownloadsInProgressByUser[u] = [];
-        }
-        self._keyDownloadsInProgressByUser[u].push(promise);
-
-        deferMap[u] = deferred;
-        promiseMap[u] = promise;
-    });
-
-    this._baseApis.downloadKeysForUsers(downloadUsers).done(function (res) {
-        var dk = res.device_keys || {};
-
-        for (var i = 0; i < downloadUsers.length; ++i) {
-            var userId = downloadUsers[i];
-            var deviceId;
-
-            console.log('got keys for ' + userId + ':', dk[userId]);
-
-            if (!dk[userId]) {
-                // no result for this user
-                var err = 'Unknown';
-                // TODO: do something with res.failures
-                deferMap[userId].reject(err);
-                continue;
-            }
-
-            // map from deviceid -> deviceinfo for this user
-            var userStore = {};
-            var devs = self._sessionStore.getEndToEndDevicesForUser(userId);
-            if (devs) {
-                for (deviceId in devs) {
-                    if (devs.hasOwnProperty(deviceId)) {
-                        var d = DeviceInfo.fromStorage(devs[deviceId], deviceId);
-                        userStore[deviceId] = d;
-                    }
-                }
-            }
-
-            _updateStoredDeviceKeysForUser(self._olmDevice, userId, userStore, dk[userId]);
-
-            // update the session store
-            var storage = {};
-            for (deviceId in userStore) {
-                if (!userStore.hasOwnProperty(deviceId)) {
-                    continue;
-                }
-
-                storage[deviceId] = userStore[deviceId].toStorage();
-            }
-            self._sessionStore.storeEndToEndDevicesForUser(userId, storage);
-
-            deferMap[userId].resolve();
-        }
-    }, function (err) {
-        downloadUsers.map(function (u) {
-            deferMap[u].reject(err);
-        });
-    });
-
-    return promiseMap;
-};
-
-function _updateStoredDeviceKeysForUser(_olmDevice, userId, userStore, userResult) {
-    var updated = false;
-
-    // remove any devices in the store which aren't in the response
-    for (var deviceId in userStore) {
-        if (!userStore.hasOwnProperty(deviceId)) {
-            continue;
-        }
-
-        if (!(deviceId in userResult)) {
-            console.log("Device " + userId + ":" + deviceId + " has been removed");
-            delete userStore[deviceId];
-            updated = true;
-        }
-    }
-
-    for (deviceId in userResult) {
-        if (!userResult.hasOwnProperty(deviceId)) {
-            continue;
-        }
-
-        var deviceResult = userResult[deviceId];
-
-        // check that the user_id and device_id in the response object are
-        // correct
-        if (deviceResult.user_id !== userId) {
-            console.warn("Mismatched user_id " + deviceResult.user_id + " in keys from " + userId + ":" + deviceId);
-            continue;
-        }
-        if (deviceResult.device_id !== deviceId) {
-            console.warn("Mismatched device_id " + deviceResult.device_id + " in keys from " + userId + ":" + deviceId);
-            continue;
-        }
-
-        if (_storeDeviceKeys(_olmDevice, userStore, deviceResult)) {
-            updated = true;
-        }
-    }
-
-    return updated;
-}
-
-/*
- * Process a device in a /query response, and add it to the userStore
- *
- * returns true if a change was made, else false
- */
-function _storeDeviceKeys(_olmDevice, userStore, deviceResult) {
-    if (!deviceResult.keys) {
-        // no keys?
-        return false;
-    }
-
-    var deviceId = deviceResult.device_id;
-    var userId = deviceResult.user_id;
-
-    var signKeyId = "ed25519:" + deviceId;
-    var signKey = deviceResult.keys[signKeyId];
-    if (!signKey) {
-        console.log("Device " + userId + ":" + deviceId + " has no ed25519 key");
-        return false;
-    }
-
-    var unsigned = deviceResult.unsigned || {};
-
-    try {
-        olmlib.verifySignature(_olmDevice, deviceResult, userId, deviceId, signKey);
-    } catch (e) {
-        console.log("Unable to verify signature on device " + userId + ":" + deviceId + ":", e);
-        return false;
-    }
-
-    // DeviceInfo
-    var deviceStore = void 0;
-
-    if (deviceId in userStore) {
-        // already have this device.
-        deviceStore = userStore[deviceId];
-
-        if (deviceStore.getFingerprint() != signKey) {
-            // this should only happen if the list has been MITMed; we are
-            // best off sticking with the original keys.
-            //
-            // Should we warn the user about it somehow?
-            console.warn("Ed25519 key for device" + userId + ": " + deviceId + " has changed");
-            return false;
-        }
-    } else {
-        userStore[deviceId] = deviceStore = new DeviceInfo(deviceId);
-    }
-
-    deviceStore.keys = deviceResult.keys || {};
-    deviceStore.algorithms = deviceResult.algorithms || [];
-    deviceStore.unsigned = unsigned;
-    return true;
-}
 
 /**
  * Get the stored device keys for a user id
@@ -6792,17 +7937,7 @@ function _storeDeviceKeys(_olmDevice, userStore, deviceResult) {
  * managed to get a list of devices for this user yet.
  */
 Crypto.prototype.getStoredDevicesForUser = function (userId) {
-    var devs = this._sessionStore.getEndToEndDevicesForUser(userId);
-    if (!devs) {
-        return null;
-    }
-    var res = [];
-    for (var deviceId in devs) {
-        if (devs.hasOwnProperty(deviceId)) {
-            res.push(DeviceInfo.fromStorage(devs[deviceId], deviceId));
-        }
-    }
-    return res;
+    return this._deviceList.getStoredDevicesForUser(userId);
 };
 
 /**
@@ -6811,15 +7946,11 @@ Crypto.prototype.getStoredDevicesForUser = function (userId) {
  * @param {string} userId
  * @param {string} deviceId
  *
- * @return {module:crypto/deviceinfo?} list of devices, or undefined
+ * @return {module:crypto/deviceinfo?} device, or undefined
  * if we don't know about this device
  */
 Crypto.prototype.getStoredDevice = function (userId, deviceId) {
-    var devs = this._sessionStore.getEndToEndDevicesForUser(userId);
-    if (!devs || !devs[deviceId]) {
-        return undefined;
-    }
-    return DeviceInfo.fromStorage(devs[deviceId], deviceId);
+    return this._deviceList.getStoredDevice(userId, deviceId);
 };
 
 /**
@@ -6866,50 +7997,6 @@ Crypto.prototype.listDeviceKeys = function (userId) {
 };
 
 /**
- * Find a device by curve25519 identity key
- *
- * @param {string} userId     owner of the device
- * @param {string} algorithm  encryption algorithm
- * @param {string} sender_key curve25519 key to match
- *
- * @return {module:crypto/deviceinfo?}
- */
-Crypto.prototype.getDeviceByIdentityKey = function (userId, algorithm, sender_key) {
-    if (algorithm !== olmlib.OLM_ALGORITHM && algorithm !== olmlib.MEGOLM_ALGORITHM) {
-        // we only deal in olm keys
-        return null;
-    }
-
-    var devices = this._sessionStore.getEndToEndDevicesForUser(userId);
-    if (!devices) {
-        return null;
-    }
-
-    for (var deviceId in devices) {
-        if (!devices.hasOwnProperty(deviceId)) {
-            continue;
-        }
-
-        var device = devices[deviceId];
-        for (var keyId in device.keys) {
-            if (!device.keys.hasOwnProperty(keyId)) {
-                continue;
-            }
-            if (keyId.indexOf("curve25519:") !== 0) {
-                continue;
-            }
-            var deviceKey = device.keys[keyId];
-            if (deviceKey == sender_key) {
-                return DeviceInfo.fromStorage(device, deviceId);
-            }
-        }
-    }
-
-    // doesn't match a known device
-    return null;
-};
-
-/**
  * Update the blocked/verified state of the given device
  *
  * @param {string} userId owner of the device
@@ -6920,8 +8007,13 @@ Crypto.prototype.getDeviceByIdentityKey = function (userId, algorithm, sender_ke
  *
  * @param {?boolean} blocked whether to mark the device as blocked. Null to
  *      leave unchanged.
+ *
+ * @param {?boolean} known whether to mark that the user has been made aware of
+ *      the existence of this device. Null to leave unchanged
+ *
+ * @return {module:crypto/deviceinfo} updated DeviceInfo
  */
-Crypto.prototype.setDeviceVerification = function (userId, deviceId, verified, blocked) {
+Crypto.prototype.setDeviceVerification = function (userId, deviceId, verified, blocked, known) {
     var devices = this._sessionStore.getEndToEndDevicesForUser(userId);
     if (!devices || !devices[deviceId]) {
         throw new Error("Unknown device " + userId + ":" + deviceId);
@@ -6942,11 +8034,17 @@ Crypto.prototype.setDeviceVerification = function (userId, deviceId, verified, b
         verificationStatus = DeviceVerification.UNVERIFIED;
     }
 
-    if (dev.verified === verificationStatus) {
-        return;
+    var knownStatus = dev.known;
+    if (known !== null && known !== undefined) {
+        knownStatus = known;
     }
-    dev.verified = verificationStatus;
-    this._sessionStore.storeEndToEndDevicesForUser(userId, devices);
+
+    if (dev.verified !== verificationStatus || dev.known !== knownStatus) {
+        dev.verified = verificationStatus;
+        dev.known = knownStatus;
+        this._sessionStore.storeEndToEndDevicesForUser(userId, devices);
+    }
+    return DeviceInfo.fromStorage(dev, deviceId);
 };
 
 /**
@@ -6987,18 +8085,18 @@ Crypto.prototype.getOlmSessionsForUser = function (userId) {
  * @return {module:crypto/deviceinfo?}
  */
 Crypto.prototype.getEventSenderDeviceInfo = function (event) {
-    var sender_key = event.getSenderKey();
+    var senderKey = event.getSenderKey();
     var algorithm = event.getWireContent().algorithm;
 
-    if (!sender_key || !algorithm) {
+    if (!senderKey || !algorithm) {
         return null;
     }
 
-    // sender_key is the Curve25519 identity key of the device which the event
+    // senderKey is the Curve25519 identity key of the device which the event
     // was sent from. In the case of Megolm, it's actually the Curve25519
     // identity key of the device which set up the Megolm session.
 
-    var device = this.getDeviceByIdentityKey(event.getSender(), algorithm, sender_key);
+    var device = this._deviceList.getDeviceByIdentityKey(event.getSender(), algorithm, senderKey);
 
     if (device === null) {
         // we haven't downloaded the details of this device yet.
@@ -7031,9 +8129,15 @@ Crypto.prototype.getEventSenderDeviceInfo = function (event) {
  * Configure a room to use encryption (ie, save a flag in the sessionstore).
  *
  * @param {string} roomId The room ID to enable encryption in.
+ *
  * @param {object} config The encryption config for the room.
+ *
+ * @param {boolean=} inhibitDeviceQuery true to suppress device list query for
+ *   users in the room (for now)
  */
-Crypto.prototype.setRoomEncryption = function (roomId, config) {
+Crypto.prototype.setRoomEncryption = function (roomId, config, inhibitDeviceQuery) {
+    var _this = this;
+
     // if we already have encryption in this room, we should ignore this event
     // (for now at least. maybe we should alert the user somehow?)
     var existingConfig = this._sessionStore.getEndToEndRoom(roomId);
@@ -7061,6 +8165,17 @@ Crypto.prototype.setRoomEncryption = function (roomId, config) {
         config: config
     });
     this._roomEncryptors[roomId] = alg;
+
+    // make sure we are tracking the device lists for all users in this room.
+    console.log("Enabling encryption in " + roomId + "; " + "starting to track device lists for all users therein");
+    var room = this._clientStore.getRoom(roomId);
+    var members = room.getJoinedMembers();
+    members.forEach(function (m) {
+        _this._deviceList.startTrackingDeviceList(m.userId);
+    });
+    if (!inhibitDeviceQuery) {
+        this._deviceList.refreshOutdatedDeviceLists();
+    }
 };
 
 /**
@@ -7216,6 +8331,18 @@ Crypto.prototype.decryptEvent = function (event) {
 };
 
 /**
+ * Handle the notification from /sync that a user has updated their device list.
+ *
+ * @param {String} userId
+ */
+Crypto.prototype.userDeviceListChanged = function (userId) {
+    this._deviceList.invalidateUserDeviceList(userId);
+
+    // don't flush the outdated device list yet - we do it once we finish
+    // processing the sync.
+};
+
+/**
  * handle an m.room.encryption event
  *
  * @private
@@ -7226,26 +8353,86 @@ Crypto.prototype._onCryptoEvent = function (event) {
     var content = event.getContent();
 
     try {
-        this.setRoomEncryption(roomId, content);
+        // inhibit the device list refresh for now - it will happen once we've
+        // finished processing the sync, in _onSyncCompleted.
+        this.setRoomEncryption(roomId, content, true);
     } catch (e) {
         console.error("Error configuring encryption in room " + roomId + ":", e);
     }
 };
 
 /**
- * handle the completion of the initial sync.
+ * handle the completion of a /sync
  *
- * Announces the new device.
+ * This is called after the processing of each successful /sync response.
+ * It is an opportunity to do a batch process on the information received.
+ *
+ * @param {Object} syncData  the data from the 'MatrixClient.sync' event
+ */
+Crypto.prototype._onSyncCompleted = function (syncData) {
+    var _this4 = this;
+
+    var nextSyncToken = syncData.nextSyncToken;
+
+    if (!syncData.oldSyncToken) {
+        console.log("Completed initial sync");
+
+        // an initialsync.
+        this._sendNewDeviceEvents();
+
+        // if we have a deviceSyncToken, we can tell the deviceList to
+        // invalidate devices which have changed since then.
+        var oldSyncToken = this._sessionStore.getEndToEndDeviceSyncToken();
+        if (oldSyncToken !== null) {
+            this._initialDeviceListInvalidationPending = true;
+            this._invalidateDeviceListsSince(oldSyncToken, nextSyncToken).catch(function (e) {
+                // if that failed, we fall back to invalidating everyone.
+                console.warn("Error fetching changed device list", e);
+                _this4._deviceList.invalidateAllDeviceLists();
+            }).done(function () {
+                _this4._initialDeviceListInvalidationPending = false;
+                _this4._deviceList.lastKnownSyncToken = nextSyncToken;
+                _this4._deviceList.refreshOutdatedDeviceLists();
+            });
+        } else {
+            // otherwise, we have to invalidate all devices for all users we
+            // are tracking.
+            console.log("Completed first initialsync; invalidating all " + "device list caches");
+            this._deviceList.invalidateAllDeviceLists();
+        }
+    }
+
+    if (!this._initialDeviceListInvalidationPending) {
+        // we can now store our sync token so that we can get an update on
+        // restart rather than having to invalidate everyone.
+        //
+        // (we don't really need to do this on every sync - we could just
+        // do it periodically)
+        this._sessionStore.storeEndToEndDeviceSyncToken(nextSyncToken);
+    }
+
+    // catch up on any new devices we got told about during the sync.
+    this._deviceList.lastKnownSyncToken = nextSyncToken;
+    this._deviceList.refreshOutdatedDeviceLists();
+
+    // we don't start uploading one-time keys until we've caught up with
+    // to-device messages, to help us avoid throwing away one-time-keys that we
+    // are about to receive messages for
+    // (https://github.com/vector-im/riot-web/issues/2782).
+    if (!syncData.catchingUp) {
+        _maybeUploadOneTimeKeys(this);
+    }
+};
+
+/**
+ * Send m.new_device messages to any devices we share a room with.
+ *
+ * (TODO: we can get rid of this once a suitable number of homeservers and
+ * clients support the more reliable device list update stream mechanism)
  *
  * @private
- * @param {module:models/room[]} rooms list of rooms the client knows about
  */
-Crypto.prototype._onInitialSyncCompleted = function (rooms) {
-    this._initialSyncCompleted = true;
-
-    // catch up on any m.new_device events which arrived during the initial sync.
-    this._flushNewDeviceRequests();
-
+Crypto.prototype._sendNewDeviceEvents = function () {
     if (this._sessionStore.getDeviceAnnounced()) {
         return;
     }
@@ -7254,32 +8441,40 @@ Crypto.prototype._onInitialSyncCompleted = function (rooms) {
     // we have arrived.
     // build a list of rooms for each user.
     var roomsByUser = {};
-    for (var i = 0; i < rooms.length; i++) {
-        var room = rooms[i];
+    var _iteratorNormalCompletion = true;
+    var _didIteratorError = false;
+    var _iteratorError = undefined;
 
-        // check for rooms with encryption enabled
-        var alg = this._roomEncryptors[room.roomId];
-        if (!alg) {
-            continue;
-        }
+    try {
+        for (var _iterator = this._getE2eRooms()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+            var room = _step.value;
 
-        // ignore any rooms which we have left
-        var me = room.getMember(this._userId);
-        if (!me || me.membership !== "join" && me.membership !== "invite") {
-            continue;
-        }
-
-        var members = room.getJoinedMembers();
-        for (var j = 0; j < members.length; j++) {
-            var m = members[j];
-            if (!roomsByUser[m.userId]) {
-                roomsByUser[m.userId] = [];
+            var members = room.getJoinedMembers();
+            for (var j = 0; j < members.length; j++) {
+                var m = members[j];
+                if (!roomsByUser[m.userId]) {
+                    roomsByUser[m.userId] = [];
+                }
+                roomsByUser[m.userId].push(room.roomId);
             }
-            roomsByUser[m.userId].push(room.roomId);
+        }
+
+        // build a per-device message for each user
+    } catch (err) {
+        _didIteratorError = true;
+        _iteratorError = err;
+    } finally {
+        try {
+            if (!_iteratorNormalCompletion && _iterator.return) {
+                _iterator.return();
+            }
+        } finally {
+            if (_didIteratorError) {
+                throw _iteratorError;
+            }
         }
     }
 
-    // build a per-device message for each user
     var content = {};
     for (var userId in roomsByUser) {
         if (!roomsByUser.hasOwnProperty(userId)) {
@@ -7297,6 +8492,57 @@ Crypto.prototype._onInitialSyncCompleted = function (rooms) {
     this._baseApis.sendToDevice("m.new_device", // OH HAI!
     content).done(function () {
         self._sessionStore.setDeviceAnnounced();
+    });
+};
+
+/**
+ * Ask the server which users have new devices since a given token,
+ * and invalidate them
+ *
+ * @param {String} oldSyncToken
+ * @param {String} lastKnownSyncToken
+ *
+ * @returns {Promise} resolves once the query is complete. Rejects if the
+ *   keyChange query fails.
+ */
+Crypto.prototype._invalidateDeviceListsSince = function (oldSyncToken, lastKnownSyncToken) {
+    var _this5 = this;
+
+    return this._baseApis.getKeyChanges(oldSyncToken, lastKnownSyncToken).then(function (r) {
+        console.log("got key changes since", oldSyncToken, ":", r.changed);
+
+        if (!r.changed || !Array.isArray(r.changed)) {
+            return;
+        }
+
+        r.changed.forEach(function (u) {
+            _this5._deviceList.invalidateUserDeviceList(u);
+        });
+    });
+};
+
+/**
+ * Get a list of the e2e-enabled rooms we are members of
+ *
+ * @returns {module:models.Room[]}
+ */
+Crypto.prototype._getE2eRooms = function () {
+    var _this6 = this;
+
+    return this._clientStore.getRooms().filter(function (room) {
+        // check for rooms with encryption enabled
+        var alg = _this6._roomEncryptors[room.roomId];
+        if (!alg) {
+            return false;
+        }
+
+        // ignore any rooms which we have left
+        var me = room.getMember(_this6._userId);
+        if (!me || me.membership !== "join" && me.membership !== "invite") {
+            return false;
+        }
+
+        return true;
     });
 };
 
@@ -7343,6 +8589,12 @@ Crypto.prototype._onRoomMembership = function (event, member, oldMembership) {
         return;
     }
 
+    if (member.membership == 'join') {
+        console.log('Join event for ' + member.userId + ' in ' + roomId);
+        // make sure we are tracking the deviceList for this user
+        this._deviceList.startTrackingDeviceList(member.userId);
+    }
+
     alg.onRoomMembership(event, member, oldMembership);
 };
 
@@ -7370,46 +8622,7 @@ Crypto.prototype._onNewDeviceEvent = function (event) {
         return;
     }
 
-    this._pendingUsersWithNewDevices[userId] = true;
-
-    // we delay handling these until the intialsync has completed, so that we
-    // can do all of them together.
-    if (this._initialSyncCompleted) {
-        this._flushNewDeviceRequests();
-    }
-};
-
-/**
- * Start device queries for any users who sent us an m.new_device recently
- */
-Crypto.prototype._flushNewDeviceRequests = function () {
-    var self = this;
-
-    var users = utils.keys(this._pendingUsersWithNewDevices);
-
-    if (users.length === 0) {
-        return;
-    }
-
-    var r = this._doKeyDownloadForUsers(users);
-
-    // we've kicked off requests to these users: remove their
-    // pending flag for now.
-    this._pendingUsersWithNewDevices = {};
-
-    users.map(function (u) {
-        r[u] = r[u].catch(function (e) {
-            console.error('Error updating device keys for user ' + u + ':', e);
-
-            // reinstate the pending flags on any users which failed; this will
-            // mean that we will do another download in the future, but won't
-            // tight-loop.
-            //
-            self._pendingUsersWithNewDevices[u] = true;
-        });
-    });
-
-    q.all(utils.values(r)).done();
+    this._deviceList.invalidateUserDeviceList(userId);
 };
 
 /**
@@ -7476,15 +8689,10 @@ Crypto.prototype._signObject = function (obj) {
     obj.signatures = sigs;
 };
 
-/**
- * @see module:crypto/algorithms/base.DecryptionError
- */
-Crypto.DecryptionError = algorithms.DecryptionError;
-
 /** */
 module.exports = Crypto;
 
-},{"../utils":36,"./OlmDevice":5,"./algorithms":7,"./deviceinfo":10,"./olmlib":12,"another-json":38,"q":42}],12:[function(require,module,exports){
+},{"../utils":44,"./DeviceList":5,"./OlmDevice":6,"./algorithms":8,"./deviceinfo":11,"./olmlib":13,"another-json":46,"q":51}],13:[function(require,module,exports){
 'use strict';
 
 /*
@@ -7726,7 +8934,220 @@ var _verifySignature = module.exports.verifySignature = function (olmDevice, obj
     olmDevice.verifySignature(signingKey, json, signature);
 };
 
-},{"../utils":36,"another-json":38,"q":42}],13:[function(require,module,exports){
+},{"../utils":44,"another-json":46,"q":51}],14:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+    value: true
+});
+
+var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }(); /*
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Copyright 2017 Vector Creations Ltd
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Licensed under the Apache License, Version 2.0 (the "License");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     you may not use this file except in compliance with the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     You may obtain a copy of the License at
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         http://www.apache.org/licenses/LICENSE-2.0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Unless required by applicable law or agreed to in writing, software
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     distributed under the License is distributed on an "AS IS" BASIS,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     See the License for the specific language governing permissions and
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     limitations under the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     */
+
+var _q = require("q");
+
+var _q2 = _interopRequireDefault(_q);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+/**
+ * Internal module. indexeddb storage for e2e.
+ *
+ * @module
+ */
+
+var VERSION = 1;
+
+/**
+ * @implements {module:crypto/store/base~CryptoStore}
+ */
+
+var IndexedDBCryptoStore = function () {
+    /**
+     * Create a new IndexedDBCryptoStore
+     *
+     * @param {IDBFactory} indexedDB  global indexedDB instance
+     * @param {string} dbName   name of db to connect to
+     */
+    function IndexedDBCryptoStore(indexedDB, dbName) {
+        _classCallCheck(this, IndexedDBCryptoStore);
+
+        if (!indexedDB) {
+            throw new Error("must pass indexedDB into IndexedDBCryptoStore");
+        }
+        this._indexedDB = indexedDB;
+        this._dbName = dbName;
+        this._dbPromise = null;
+    }
+
+    /**
+     * Ensure the database exists and is up-to-date
+     *
+     * @return {Promise} resolves to an instance of IDBDatabase when
+     * the database is ready
+     */
+
+
+    _createClass(IndexedDBCryptoStore, [{
+        key: "connect",
+        value: function connect() {
+            var _this = this;
+
+            if (this._dbPromise) {
+                return this._dbPromise;
+            }
+
+            this._dbPromise = new _q2.default.Promise(function (resolve, reject) {
+                var req = _this._indexedDB.open(_this._dbName, VERSION);
+
+                req.onupgradeneeded = function (ev) {
+                    var db = ev.target.result;
+                    var oldVersion = ev.oldVersion;
+                    console.log("Upgrading IndexedDBCryptoStore from version " + oldVersion + (" to " + VERSION));
+                    if (oldVersion < 1) {
+                        // The database did not previously exist.
+                        createDatabase(db);
+                    }
+                    // Expand as needed.
+                };
+
+                req.onblocked = function () {
+                    reject(new Error("unable to upgrade indexeddb because it is open elsewhere"));
+                };
+
+                req.onerror = function (ev) {
+                    reject(new Error("unable to connect to indexeddb: " + ev.target.error));
+                };
+
+                req.onsuccess = function (r) {
+                    resolve(r.target.result);
+                };
+            });
+            return this._dbPromise;
+        }
+
+        /**
+         * Delete all data from this store.
+         *
+         * @returns {Promise} resolves when the store has been cleared.
+         */
+
+    }, {
+        key: "deleteAllData",
+        value: function deleteAllData() {
+            var _this2 = this;
+
+            return new _q2.default.Promise(function (resolve, reject) {
+                console.log("Removing indexeddb instance: " + _this2._dbName);
+                var req = _this2._indexedDB.deleteDatabase(_this2._dbName);
+                req.onerror = function (ev) {
+                    reject(new Error("unable to delete indexeddb: " + ev.target.error));
+                };
+
+                req.onsuccess = function () {
+                    console.log("Removed indexeddb instance: " + _this2._dbName);
+                    resolve();
+                };
+            });
+        }
+    }]);
+
+    return IndexedDBCryptoStore;
+}();
+
+exports.default = IndexedDBCryptoStore;
+
+
+function createDatabase(db) {
+    var outgoingRoomKeyRequestsStore = db.createObjectStore("outgoingRoomKeyRequests", { keyPath: "requestId" });
+
+    // we assume that the RoomKeyRequestBody will have room_id and session_id
+    // properties, to make the index efficient.
+    outgoingRoomKeyRequestsStore.createIndex("session", ["requestBody.room_id", "requestBody.session_id"]);
+
+    outgoingRoomKeyRequestsStore.createIndex("state", "state");
+}
+
+},{"q":51}],15:[function(require,module,exports){
+'use strict';
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+
+var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }(); /*
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Copyright 2017 Vector Creations Ltd
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Licensed under the Apache License, Version 2.0 (the "License");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     you may not use this file except in compliance with the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     You may obtain a copy of the License at
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         http://www.apache.org/licenses/LICENSE-2.0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Unless required by applicable law or agreed to in writing, software
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     distributed under the License is distributed on an "AS IS" BASIS,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     See the License for the specific language governing permissions and
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     limitations under the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     */
+
+var _q = require('q');
+
+var _q2 = _interopRequireDefault(_q);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+/**
+ * Internal module. in-memory storage for e2e.
+ *
+ * @module
+ */
+
+/**
+ * @implements {module:crypto/store/base~CryptoStore}
+ */
+var MemoryCryptoStore = function () {
+  function MemoryCryptoStore() {
+    _classCallCheck(this, MemoryCryptoStore);
+  }
+
+  /**
+   * Delete all data from this store.
+   *
+   * @returns {Promise} Promise which resolves when the store has been cleared.
+   */
+
+
+  _createClass(MemoryCryptoStore, [{
+    key: 'deleteAllData',
+    value: function deleteAllData() {
+      return (0, _q2.default)();
+    }
+  }]);
+
+  return MemoryCryptoStore;
+}();
+
+exports.default = MemoryCryptoStore;
+
+},{"q":51}],16:[function(require,module,exports){
 /*
 Copyright 2016 OpenMarket Ltd
 
@@ -7868,7 +9289,7 @@ FilterComponent.prototype.limit = function () {
 /** The FilterComponent class */
 module.exports = FilterComponent;
 
-},{}],14:[function(require,module,exports){
+},{}],17:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -8060,7 +9481,7 @@ Filter.fromJson = function (userId, filterId, jsonObj) {
 /** The Filter class */
 module.exports = Filter;
 
-},{"./filter-component":13}],15:[function(require,module,exports){
+},{"./filter-component":16}],18:[function(require,module,exports){
 (function (global){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
@@ -8201,8 +9622,6 @@ module.exports.MatrixHttpApi.prototype = {
      *    opts.onlyContentUri.  Rejects with an error (usually a MatrixError).
      */
     uploadContent: function uploadContent(file, opts) {
-        var _this = this;
-
         if (utils.isFunction(opts)) {
             // opts used to be callback
             opts = {
@@ -8273,62 +9692,60 @@ module.exports.MatrixHttpApi.prototype = {
         }
 
         if (global.XMLHttpRequest) {
-            (function () {
-                var defer = q.defer();
-                var xhr = new global.XMLHttpRequest();
-                upload.xhr = xhr;
-                var cb = requestCallback(defer, opts.callback, _this.opts.onlyData);
+            var defer = q.defer();
+            var xhr = new global.XMLHttpRequest();
+            upload.xhr = xhr;
+            var cb = requestCallback(defer, opts.callback, this.opts.onlyData);
 
-                var timeout_fn = function timeout_fn() {
-                    xhr.abort();
-                    cb(new Error('Timeout'));
-                };
+            var timeout_fn = function timeout_fn() {
+                xhr.abort();
+                cb(new Error('Timeout'));
+            };
 
-                // set an initial timeout of 30s; we'll advance it each time we get
-                // a progress notification
-                xhr.timeout_timer = callbacks.setTimeout(timeout_fn, 30000);
+            // set an initial timeout of 30s; we'll advance it each time we get
+            // a progress notification
+            xhr.timeout_timer = callbacks.setTimeout(timeout_fn, 30000);
 
-                xhr.onreadystatechange = function () {
-                    switch (xhr.readyState) {
-                        case global.XMLHttpRequest.DONE:
-                            callbacks.clearTimeout(xhr.timeout_timer);
-                            var resp;
-                            try {
-                                if (!xhr.responseText) {
-                                    throw new Error('No response body.');
-                                }
-                                resp = xhr.responseText;
-                                if (bodyParser) {
-                                    resp = bodyParser(resp);
-                                }
-                            } catch (err) {
-                                err.http_status = xhr.status;
-                                cb(err);
-                                return;
+            xhr.onreadystatechange = function () {
+                switch (xhr.readyState) {
+                    case global.XMLHttpRequest.DONE:
+                        callbacks.clearTimeout(xhr.timeout_timer);
+                        var resp;
+                        try {
+                            if (!xhr.responseText) {
+                                throw new Error('No response body.');
                             }
-                            cb(undefined, xhr, resp);
-                            break;
-                    }
-                };
-                xhr.upload.addEventListener("progress", function (ev) {
-                    callbacks.clearTimeout(xhr.timeout_timer);
-                    upload.loaded = ev.loaded;
-                    upload.total = ev.total;
-                    xhr.timeout_timer = callbacks.setTimeout(timeout_fn, 30000);
-                    defer.notify(ev);
-                });
-                var url = _this.opts.baseUrl + "/_matrix/media/v1/upload";
-                url += "?access_token=" + encodeURIComponent(_this.opts.accessToken);
-                url += "&filename=" + encodeURIComponent(fileName);
+                            resp = xhr.responseText;
+                            if (bodyParser) {
+                                resp = bodyParser(resp);
+                            }
+                        } catch (err) {
+                            err.http_status = xhr.status;
+                            cb(err);
+                            return;
+                        }
+                        cb(undefined, xhr, resp);
+                        break;
+                }
+            };
+            xhr.upload.addEventListener("progress", function (ev) {
+                callbacks.clearTimeout(xhr.timeout_timer);
+                upload.loaded = ev.loaded;
+                upload.total = ev.total;
+                xhr.timeout_timer = callbacks.setTimeout(timeout_fn, 30000);
+                defer.notify(ev);
+            });
+            var url = this.opts.baseUrl + "/_matrix/media/v1/upload";
+            url += "?access_token=" + encodeURIComponent(this.opts.accessToken);
+            url += "&filename=" + encodeURIComponent(fileName);
 
-                xhr.open("POST", url);
-                xhr.setRequestHeader("Content-Type", contentType);
-                xhr.send(body);
-                promise = defer.promise;
+            xhr.open("POST", url);
+            xhr.setRequestHeader("Content-Type", contentType);
+            xhr.send(body);
+            promise = defer.promise;
 
-                // dirty hack (as per _request) to allow the upload to be cancelled.
-                promise.abort = xhr.abort.bind(xhr);
-            })();
+            // dirty hack (as per _request) to allow the upload to be cancelled.
+            promise.abort = xhr.abort.bind(xhr);
         } else {
             var queryParams = {
                 filename: fileName
@@ -8670,19 +10087,26 @@ module.exports.MatrixHttpApi.prototype = {
         var timedOut = false;
         var req = void 0;
         var localTimeoutMs = opts.localTimeoutMs || this.opts.localTimeoutMs;
-        if (localTimeoutMs) {
-            timeoutId = callbacks.setTimeout(function () {
-                timedOut = true;
-                if (req && req.abort) {
-                    req.abort();
+
+        var resetTimeout = function resetTimeout() {
+            if (localTimeoutMs) {
+                if (timeoutId) {
+                    callbacks.clearTimeout(timeoutId);
                 }
-                defer.reject(new module.exports.MatrixError({
-                    error: "Locally timed out waiting for a response",
-                    errcode: "ORG.MATRIX.JSSDK_TIMEOUT",
-                    timeout: localTimeoutMs
-                }));
-            }, localTimeoutMs);
-        }
+                timeoutId = callbacks.setTimeout(function () {
+                    timedOut = true;
+                    if (req && req.abort) {
+                        req.abort();
+                    }
+                    defer.reject(new module.exports.MatrixError({
+                        error: "Locally timed out waiting for a response",
+                        errcode: "ORG.MATRIX.JSSDK_TIMEOUT",
+                        timeout: localTimeoutMs
+                    }));
+                }, localTimeoutMs);
+            }
+        };
+        resetTimeout();
 
         var reqPromise = defer.promise;
 
@@ -8711,10 +10135,22 @@ module.exports.MatrixHttpApi.prototype = {
                 var handlerFn = requestCallback(defer, callback, self.opts.onlyData, parseErrorJson, opts.bodyParser);
                 handlerFn(err, response, body);
             });
-            if (req && req.abort) {
+            if (req) {
+                // This will only work in a browser, where opts.request is the
+                // `browser-request` import. Currently `request` does not support progress
+                // updates - see https://github.com/request/request/pull/2346.
+                // `browser-request` returns an XHRHttpRequest which exposes `onprogress`
+                if ('onprogress' in req) {
+                    req.onprogress = function (e) {
+                        // Prevent the timeout from rejecting the deferred promise if progress is
+                        // seen with the request
+                        resetTimeout();
+                    };
+                }
+
                 // FIXME: This is EVIL, but I can't think of a better way to expose
                 // abort() operations on underlying HTTP requests :(
-                reqPromise.abort = req.abort.bind(req);
+                if (req.abort) reqPromise.abort = req.abort.bind(req);
             }
         } catch (ex) {
             defer.reject(ex);
@@ -8799,9 +10235,10 @@ module.exports.MatrixError.prototype.constructor = module.exports.MatrixError;
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"./realtime-callbacks":29,"./utils":36,"q":42}],16:[function(require,module,exports){
+},{"./realtime-callbacks":32,"./utils":44,"q":51}],19:[function(require,module,exports){
 /*
 Copyright 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -8820,8 +10257,12 @@ limitations under the License.
 /** @module interactive-auth */
 
 var q = require("q");
+var url = require("url");
 
 var utils = require("./utils");
+
+var EMAIL_STAGE_TYPE = "m.login.email.identity";
+var MSISDN_STAGE_TYPE = "m.login.msisdn";
 
 /**
  * Abstracts the logic used to drive the interactive auth process.
@@ -8840,44 +10281,123 @@ var utils = require("./utils");
  *
  * @param {object} opts  options object
  *
+ * @param {object} opts.matrixClient A matrix client to use for the auth process
+ *
  * @param {object?} opts.authData error response from the last request. If
  *    null, a request will be made with no auth before starting.
  *
- * @param {function(object?): module:client.Promise} opts.doRequest
- *     called with the new auth dict to submit the request. Should return a
+ * @param {function(object?, bool?): module:client.Promise} opts.doRequest
+ *     called with the new auth dict to submit the request and a flag set
+ *     to true if this request is a background request. Should return a
  *     promise which resolves to the successful response or rejects with a
  *     MatrixError.
  *
- * @param {function(string, object?)} opts.startAuthStage
- *     called to ask the UI to start a particular auth stage. The arguments
- *     are: the login type (eg m.login.password); and (if the last request
- *     returned an error), an error object, with fields 'errcode' and 'error'.
+ * @param {function(string, object?)} opts.stateUpdated
+ *     called when the status of the UI auth changes, ie. when the state of
+ *     an auth stage changes of when the auth flow moves to a new stage.
+ *     The arguments are: the login type (eg m.login.password); and an object
+ *     which is either an error or an informational object specific to the
+ *     login type. If the 'errcode' key is defined, the object is an error,
+ *     and has keys:
+ *         errcode: string, the textual error code, eg. M_UNKNOWN
+ *         error: string, human readable string describing the error
+ *
+ *     The login type specific objects are as follows:
+ *         m.login.email.identity:
+ *          * emailSid: string, the sid of the active email auth session
+ *
+ * @param {object?} opts.inputs Inputs provided by the user and used by different
+ *     stages of the auto process. The inputs provided will affect what flow is chosen.
+ *
+ * @param {string?} opts.inputs.emailAddress An email address. If supplied, a flow
+ *     using email verification will be chosen.
+ *
+ * @param {string?} opts.inputs.phoneCountry An ISO two letter country code. Gives
+ *     the country that opts.phoneNumber should be resolved relative to.
+ *
+ * @param {string?} opts.inputs.phoneNumber A phone number. If supplied, a flow
+ *     using phone number validation will be chosen.
+ *
+ * @param {string?} opts.sessionId If resuming an existing interactive auth session,
+ *     the sessionId of that session.
+ *
+ * @param {string?} opts.clientSecret If resuming an existing interactive auth session,
+ *     the client secret for that session
+ *
+ * @param {string?} opts.emailSid If returning from having completed m.login.email.identity
+ *     auth, the sid for the email verification session.
  *
  */
 function InteractiveAuth(opts) {
-    this._data = opts.authData;
+    this._matrixClient = opts.matrixClient;
+    this._data = opts.authData || {};
     this._requestCallback = opts.doRequest;
-    this._startAuthStageCallback = opts.startAuthStage;
+    // startAuthStage included for backwards compat
+    this._stateUpdatedCallback = opts.stateUpdated || opts.startAuthStage;
     this._completionDeferred = null;
+    this._inputs = opts.inputs || {};
+
+    if (opts.sessionId) this._data.session = opts.sessionId;
+    this._clientSecret = opts.clientSecret || this._matrixClient.generateClientSecret();
+    this._emailSid = opts.emailSid;
+    if (this._emailSid === undefined) this._emailSid = null;
+
+    this._currentStage = null;
 }
 
 InteractiveAuth.prototype = {
     /**
      * begin the authentication process.
      *
-     * @return {module:client.Promise}  which resolves to the response on success,
-     * or rejects with the error on failure.
+     * @return {module:client.Promise} which resolves to the response on success,
+     * or rejects with the error on failure. Rejects with NoAuthFlowFoundError if
+     *     no suitable authentication flow can be found
      */
     attemptAuth: function attemptAuth() {
+        var _this = this;
+
         this._completionDeferred = q.defer();
 
-        if (!this._data) {
-            this._doRequest(null);
-        } else {
-            this._startNextAuthStage();
+        // wrap in a promise so that if _startNextAuthStage
+        // throws, it rejects the promise in a consistent way
+        return q().then(function () {
+            // if we have no flows, try a request (we'll have
+            // just a session ID in _data if resuming)
+            if (!_this._data.flows) {
+                _this._doRequest(_this._data);
+            } else {
+                _this._startNextAuthStage();
+            }
+            return _this._completionDeferred.promise;
+        });
+    },
+
+    /**
+     * Poll to check if the auth session or current stage has been
+     * completed out-of-band. If so, the attemptAuth promise will
+     * be resolved.
+     */
+    poll: function poll() {
+        if (!this._data.session) return;
+
+        var authDict = {};
+        if (this._currentStage == EMAIL_STAGE_TYPE) {
+            // The email can be validated out-of-band, but we need to provide the
+            // creds so the HS can go & check it.
+            if (this._emailSid) {
+                var idServerParsedUrl = url.parse(this._matrixClient.getIdentityServerUrl());
+                authDict = {
+                    type: EMAIL_STAGE_TYPE,
+                    threepid_creds: {
+                        sid: this._emailSid,
+                        client_secret: this._clientSecret,
+                        id_server: idServerParsedUrl.host
+                    }
+                };
+            }
         }
 
-        return this._completionDeferred.promise;
+        this.submitAuthDict(authDict, true);
     },
 
     /**
@@ -8887,6 +10407,16 @@ InteractiveAuth.prototype = {
      */
     getSessionId: function getSessionId() {
         return this._data ? this._data.session : undefined;
+    },
+
+    /**
+     * get the client secret used for validation sessions
+     * with the ID server.
+     *
+     * @return {string} client secret
+     */
+    getClientSecret: function getClientSecret() {
+        return this._clientSecret;
     },
 
     /**
@@ -8911,8 +10441,11 @@ InteractiveAuth.prototype = {
      * @param {object} authData new auth dict to send to the server. Should
      *    include a `type` propterty denoting the login type, as well as any
      *    other params for that stage.
+     * @param {bool} background If true, this request failing will not result
+     *    in the attemptAuth promise being rejected. This can be set to true
+     *    for requests that just poll to see if auth has been completed elsewhere.
      */
-    submitAuthDict: function submitAuthDict(authData) {
+    submitAuthDict: function submitAuthDict(authData, background) {
         if (!this._completionDeferred) {
             throw new Error("submitAuthDict() called before attemptAuth()");
         }
@@ -8923,7 +10456,29 @@ InteractiveAuth.prototype = {
         };
         utils.extend(auth, authData);
 
-        this._doRequest(auth);
+        this._doRequest(auth, background);
+    },
+
+    /**
+     * Gets the sid for the email validation session
+     * Specific to m.login.email.identity
+     *
+     * @returns {string} The sid of the email auth session
+     */
+    getEmailSid: function getEmailSid() {
+        return this._emailSid;
+    },
+
+    /**
+     * Sets the sid for the email validation session
+     * This must be set in order to successfully poll for completion
+     * of the email validation.
+     * Specific to m.login.email.identity
+     *
+     * @param {string} sid The sid for the email validation session
+     */
+    setEmailSid: function setEmailSid(sid) {
+        this._emailSid = sid;
     },
 
     /**
@@ -8932,8 +10487,12 @@ InteractiveAuth.prototype = {
      *
      * @private
      * @param {object?} auth new auth dict, including session id
+     * @param {bool?} background If true, this request is a background poll, so it
+     *    failing will not result in the attemptAuth promise being rejected.
+     *    This can be set to true for requests that just poll to see if auth has
+     *    been completed elsewhere.
      */
-    _doRequest: function _doRequest(auth) {
+    _doRequest: function _doRequest(auth, background) {
         var self = this;
 
         // hackery to make sure that synchronous exceptions end up in the catch
@@ -8941,43 +10500,81 @@ InteractiveAuth.prototype = {
         // extra q().then)
         var prom = void 0;
         try {
-            prom = this._requestCallback(auth);
+            prom = this._requestCallback(auth, background);
         } catch (e) {
             prom = q.reject(e);
         }
 
-        prom.then(function (result) {
+        prom = prom.then(function (result) {
             console.log("result from request: ", result);
             self._completionDeferred.resolve(result);
         }, function (error) {
-            if (error.httpStatus !== 401 || !error.data || !error.data.flows) {
+            // sometimes UI auth errors don't come with flows
+            var errorFlows = error.data ? error.data.flows : null;
+            var haveFlows = Boolean(self._data.flows) || Boolean(errorFlows);
+            if (error.httpStatus !== 401 || !error.data || !haveFlows) {
                 // doesn't look like an interactive-auth failure. fail the whole lot.
                 throw error;
             }
+            // if the error didn't come with flows, completed flows or session ID,
+            // copy over the ones we have. Synapse sometimes sends responses without
+            // any UI auth data (eg. when polling for email validation, if the email
+            // has not yet been validated). This appears to be a Synapse bug, which
+            // we workaround here.
+            if (!error.data.flows && !error.data.completed && !error.data.session) {
+                error.data.flows = self._data.flows;
+                error.data.completed = self._data.completed;
+                error.data.session = self._data.session;
+            }
             self._data = error.data;
             self._startNextAuthStage();
-        }).catch(this._completionDeferred.reject).done();
+        });
+        if (!background) {
+            prom = prom.catch(this._completionDeferred.reject);
+        } else {
+            // We ignore all failures here (even non-UI auth related ones)
+            // since we don't want to suddenly fail if the internet connection
+            // had a blip whilst we were polling
+            prom = prom.catch(function (error) {
+                console.log("Ignoring error from UI auth: " + error);
+            });
+        }
+        prom.done();
     },
 
     /**
      * Pick the next stage and call the callback
      *
      * @private
+     * @throws {NoAuthFlowFoundError} If no suitable authentication flow can be found
      */
     _startNextAuthStage: function _startNextAuthStage() {
         var nextStage = this._chooseStage();
         if (!nextStage) {
             throw new Error("No incomplete flows from the server");
         }
+        this._currentStage = nextStage;
 
-        var stageError = null;
+        if (nextStage == 'm.login.dummy') {
+            this.submitAuthDict({
+                type: 'm.login.dummy'
+            });
+            return;
+        }
+
         if (this._data.errcode || this._data.error) {
-            stageError = {
+            this._stateUpdatedCallback(nextStage, {
                 errcode: this._data.errcode || "",
                 error: this._data.error || ""
-            };
+            });
+            return;
         }
-        this._startAuthStageCallback(nextStage, stageError);
+
+        var stageStatus = {};
+        if (nextStage == EMAIL_STAGE_TYPE) {
+            stageStatus.emailSid = this._emailSid;
+        }
+        this._stateUpdatedCallback(nextStage, stageStatus);
     },
 
     /**
@@ -8985,6 +10582,7 @@ InteractiveAuth.prototype = {
      *
      * @private
      * @return {string?} login type
+     * @throws {NoAuthFlowFoundError} If no suitable authentication flow can be found
      */
     _chooseStage: function _chooseStage() {
         var flow = this._chooseFlow();
@@ -8996,14 +10594,93 @@ InteractiveAuth.prototype = {
 
     /**
      * Pick one of the flows from the returned list
+     * If a flow using all of the inputs is found, it will
+     * be returned, otherwise, null will be returned.
+     *
+     * Only flows using all given inputs are chosen because it
+     * is likley to be surprising if the user provides a
+     * credential and it is not used. For example, for registration,
+     * this could result in the email not being used which would leave
+     * the account with no means to reset a password.
      *
      * @private
      * @return {object} flow
+     * @throws {NoAuthFlowFoundError} If no suitable authentication flow can be found
      */
     _chooseFlow: function _chooseFlow() {
         var flows = this._data.flows || [];
-        // always use the first flow for now
-        return flows[0];
+
+        // we've been given an email or we've already done an email part
+        var haveEmail = Boolean(this._inputs.emailAddress) || Boolean(this._emailSid);
+        var haveMsisdn = Boolean(this._inputs.phoneCountry) && Boolean(this._inputs.phoneNumber);
+
+        var _iteratorNormalCompletion = true;
+        var _didIteratorError = false;
+        var _iteratorError = undefined;
+
+        try {
+            for (var _iterator = flows[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+                var flow = _step.value;
+
+                var flowHasEmail = false;
+                var flowHasMsisdn = false;
+                var _iteratorNormalCompletion2 = true;
+                var _didIteratorError2 = false;
+                var _iteratorError2 = undefined;
+
+                try {
+                    for (var _iterator2 = flow.stages[Symbol.iterator](), _step2; !(_iteratorNormalCompletion2 = (_step2 = _iterator2.next()).done); _iteratorNormalCompletion2 = true) {
+                        var stage = _step2.value;
+
+                        if (stage === EMAIL_STAGE_TYPE) {
+                            flowHasEmail = true;
+                        } else if (stage == MSISDN_STAGE_TYPE) {
+                            flowHasMsisdn = true;
+                        }
+                    }
+                } catch (err) {
+                    _didIteratorError2 = true;
+                    _iteratorError2 = err;
+                } finally {
+                    try {
+                        if (!_iteratorNormalCompletion2 && _iterator2.return) {
+                            _iterator2.return();
+                        }
+                    } finally {
+                        if (_didIteratorError2) {
+                            throw _iteratorError2;
+                        }
+                    }
+                }
+
+                if (flowHasEmail == haveEmail && flowHasMsisdn == haveMsisdn) {
+                    return flow;
+                }
+            }
+            // Throw an error with a fairly generic description, but with more
+            // information such that the app can give a better one if so desired.
+        } catch (err) {
+            _didIteratorError = true;
+            _iteratorError = err;
+        } finally {
+            try {
+                if (!_iteratorNormalCompletion && _iterator.return) {
+                    _iterator.return();
+                }
+            } finally {
+                if (_didIteratorError) {
+                    throw _iteratorError;
+                }
+            }
+        }
+
+        var err = new Error("No appropriate authentication flow found");
+        err.name = 'NoAuthFlowFoundError';
+        err.required_stages = [];
+        if (haveEmail) err.required_stages.push(EMAIL_STAGE_TYPE);
+        if (haveMsisdn) err.required_stages.push(MSISDN_STAGE_TYPE);
+        err.available_flows = flows;
+        throw err;
     },
 
     /**
@@ -9027,10 +10704,11 @@ InteractiveAuth.prototype = {
 /** */
 module.exports = InteractiveAuth;
 
-},{"./utils":36,"q":42}],17:[function(require,module,exports){
+},{"./utils":44,"q":51,"url":55}],20:[function(require,module,exports){
 (function (global){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -9053,6 +10731,12 @@ module.exports.MatrixEvent = require("./models/event").MatrixEvent;
 module.exports.EventStatus = require("./models/event").EventStatus;
 /** The {@link module:store/memory.MatrixInMemoryStore|MatrixInMemoryStore} class. */
 module.exports.MatrixInMemoryStore = require("./store/memory").MatrixInMemoryStore;
+/** The {@link module:store/indexeddb.IndexedDBStore|IndexedDBStore} class. */
+module.exports.IndexedDBStore = require("./store/indexeddb").IndexedDBStore;
+/** The {@link module:store/indexeddb.IndexedDBStoreBackend|IndexedDBStoreBackend} class. */
+module.exports.IndexedDBStoreBackend = require("./store/indexeddb").IndexedDBStoreBackend;
+/** The {@link module:sync-accumulator.SyncAccumulator|SyncAccumulator} class. */
+module.exports.SyncAccumulator = require("./sync-accumulator");
 /** The {@link module:http-api.MatrixHttpApi|MatrixHttpApi} class. */
 module.exports.MatrixHttpApi = require("./http-api").MatrixHttpApi;
 /** The {@link module:http-api.MatrixError|MatrixError} class. */
@@ -9087,6 +10771,9 @@ module.exports.TimelineWindow = require("./timeline-window").TimelineWindow;
 /** The {@link module:interactive-auth} class. */
 module.exports.InteractiveAuth = require("./interactive-auth");
 
+module.exports.MemoryCryptoStore = require("./crypto/store/memory-crypto-store").default;
+module.exports.IndexedDBCryptoStore = require("./crypto/store/indexeddb-crypto-store").default;
+
 /**
  * Create a new Matrix Call.
  * @function
@@ -9096,6 +10783,21 @@ module.exports.InteractiveAuth = require("./interactive-auth");
  * does not support WebRTC.
  */
 module.exports.createNewMatrixCall = require("./webrtc/call").createNewMatrixCall;
+
+/**
+ * Set an audio input device to use for MatrixCalls
+ * @function
+ * @param {string=} deviceId the identifier for the device
+ * undefined treated as unset
+ */
+module.exports.setMatrixCallAudioInput = require('./webrtc/call').setAudioInput;
+/**
+ * Set a video input device to use for MatrixCalls
+ * @function
+ * @param {string=} deviceId the identifier for the device
+ * undefined treated as unset
+ */
+module.exports.setMatrixCallVideoInput = require('./webrtc/call').setVideoInput;
 
 // expose the underlying request object so different environments can use
 // different request libs (e.g. request or browser-request)
@@ -9131,6 +10833,20 @@ module.exports.wrapRequest = function (wrapper) {
   };
 };
 
+var cryptoStoreFactory = function cryptoStoreFactory() {
+  return new module.exports.MemoryCryptoStore();
+};
+
+/**
+ * Configure a different factory to be used for creating crypto stores
+ *
+ * @param {Function} fac  a function which will return a new
+ *    {@link module:crypto.store.base~CryptoStore}.
+ */
+module.exports.setCryptoStoreFactory = function (fac) {
+  cryptoStoreFactory = fac;
+};
+
 /**
  * Construct a Matrix Client. Similar to {@link module:client~MatrixClient}
  * except that the 'request', 'store' and 'scheduler' dependencies are satisfied.
@@ -9143,6 +10859,13 @@ module.exports.wrapRequest = function (wrapper) {
  * {@link module:scheduler~MatrixScheduler}.
  * @param {requestFunction} opts.request If not set, defaults to the function
  * supplied to {@link request} which defaults to the request module from NPM.
+ *
+ * @param {module:crypto.store.base~CryptoStore=} opts.cryptoStore
+ *    crypto store implementation. Calls the factory supplied to
+ *    {@link setCryptoStoreFactory} if unspecified; or if no factory has been
+ *    specified, uses a default implementation (indexeddb in the browser,
+ *    in-memory otherwise).
+ *
  * @return {MatrixClient} A new matrix client.
  * @see {@link module:client~MatrixClient} for the full list of options for
  * <code>opts</code>.
@@ -9158,6 +10881,7 @@ module.exports.createClient = function (opts) {
     localStorage: global.localStorage
   });
   opts.scheduler = opts.scheduler || new module.exports.MatrixScheduler();
+  opts.cryptoStore = opts.cryptoStore || cryptoStoreFactory();
   return new module.exports.MatrixClient(opts);
 };
 
@@ -9202,7 +10926,7 @@ module.exports.createClient = function (opts) {
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"./client":3,"./content-repo":4,"./filter":14,"./http-api":15,"./interactive-auth":16,"./models/event":21,"./models/event-timeline":20,"./models/event-timeline-set":19,"./models/room":25,"./models/room-member":22,"./models/room-state":23,"./models/user":27,"./scheduler":30,"./store/memory":31,"./store/session/webstorage":32,"./timeline-window":35,"./webrtc/call":37}],18:[function(require,module,exports){
+},{"./client":3,"./content-repo":4,"./crypto/store/indexeddb-crypto-store":14,"./crypto/store/memory-crypto-store":15,"./filter":17,"./http-api":18,"./interactive-auth":19,"./models/event":24,"./models/event-timeline":23,"./models/event-timeline-set":22,"./models/room":28,"./models/room-member":25,"./models/room-state":26,"./models/user":30,"./scheduler":34,"./store/indexeddb":37,"./store/memory":38,"./store/session/webstorage":39,"./sync-accumulator":41,"./timeline-window":43,"./webrtc/call":45}],21:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -9324,7 +11048,7 @@ EventContext.prototype.addEvents = function (events, atStart) {
  */
 module.exports = EventContext;
 
-},{}],19:[function(require,module,exports){
+},{}],22:[function(require,module,exports){
 /*
 Copyright 2016 OpenMarket Ltd
 
@@ -9482,10 +11206,11 @@ EventTimelineSet.prototype.replaceEventId = function (oldEventId, newEventId) {
  * @fires module:client~MatrixClient#event:"Room.timelineReset"
  */
 EventTimelineSet.prototype.resetLiveTimeline = function (backPaginationToken, flush) {
-    var newTimeline = void 0;
+    // if timeline support is disabled, forget about the old timelines
+    var resetAllTimelines = !this._timelineSupport || flush;
 
-    if (!this._timelineSupport || flush) {
-        // if timeline support is disabled, forget about the old timelines
+    var newTimeline = void 0;
+    if (resetAllTimelines) {
         newTimeline = new EventTimeline(this);
         this._timelines = [newTimeline];
         this._eventIdToTimeline = {};
@@ -9515,7 +11240,7 @@ EventTimelineSet.prototype.resetLiveTimeline = function (backPaginationToken, fl
     newTimeline.setPaginationToken(backPaginationToken, EventTimeline.BACKWARDS);
 
     this._liveTimeline = newTimeline;
-    this.emit("Room.timelineReset", this.room, this);
+    this.emit("Room.timelineReset", this.room, this, resetAllTimelines);
 };
 
 /**
@@ -9959,9 +11684,25 @@ module.exports = EventTimelineSet;
  * @event module:client~MatrixClient#"Room.timelineReset"
  * @param {Room} room The room whose live timeline was reset, if any
  * @param {EventTimelineSet} timelineSet timelineSet room whose live timeline was reset
+ * @param {boolean} resetAllTimelines True if all timelines were reset.
  */
 
-},{"../utils":36,"./event-timeline":20,"events":46}],20:[function(require,module,exports){
+},{"../utils":44,"./event-timeline":23,"events":48}],23:[function(require,module,exports){
+/*
+Copyright 2016, 2017 OpenMarket Ltd
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 "use strict";
 
 /**
@@ -10294,7 +12035,7 @@ EventTimeline.prototype.toString = function () {
  */
 module.exports = EventTimeline;
 
-},{"../utils":36,"./event":21,"./room-state":23}],21:[function(require,module,exports){
+},{"../utils":44,"./event":24,"./room-state":26}],24:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -10346,6 +12087,8 @@ module.exports.EventStatus = {
     CANCELLED: "cancelled"
 };
 
+var interns = {};
+
 /**
  * Construct a Matrix Event object
  * @constructor
@@ -10358,19 +12101,47 @@ module.exports.EventStatus = {
  * from changes to event JSON between Matrix versions.
  *
  * @prop {RoomMember} sender The room member who sent this event, or null e.g.
- * this is a presence event.
+ * this is a presence event. This is only guaranteed to be set for events that
+ * appear in a timeline, ie. do not guarantee that it will be set on state
+ * events.
  * @prop {RoomMember} target The room member who is the target of this event, e.g.
  * the invitee, the person being banned, etc.
  * @prop {EventStatus} status The sending status of the event.
+ * @prop {Error} error most recent error associated with sending the event, if any
  * @prop {boolean} forwardLooking True if this event is 'forward looking', meaning
  * that getDirectionalContent() will return event.content and not event.prev_content.
  * Default: true. <strong>This property is experimental and may change.</strong>
  */
 module.exports.MatrixEvent = function MatrixEvent(event) {
+    // intern the values of matrix events to force share strings and reduce the
+    // amount of needless string duplication. This can save moderate amounts of
+    // memory (~10% on a 350MB heap).
+    ["state_key", "type", "sender", "room_id"].forEach(function (prop) {
+        if (!event[prop]) {
+            return;
+        }
+        if (!interns[event[prop]]) {
+            interns[event[prop]] = event[prop];
+        }
+        event[prop] = interns[event[prop]];
+    });
+
+    ["membership", "avatar_url", "displayname"].forEach(function (prop) {
+        if (!event.content || !event.content[prop]) {
+            return;
+        }
+        if (!interns[event.content[prop]]) {
+            interns[event.content[prop]] = event.content[prop];
+        }
+        event.content[prop] = interns[event.content[prop]];
+    });
+
     this.event = event || {};
+
     this.sender = null;
     this.target = null;
     this.status = null;
+    this.error = null;
     this.forwardLooking = true;
     this._pushActions = null;
     this._date = this.event.origin_server_ts ? new Date(this.event.origin_server_ts) : null;
@@ -10694,29 +12465,16 @@ utils.extend(module.exports.MatrixEvent.prototype, {
     }
 });
 
-/* http://matrix.org/docs/spec/r0.0.1/client_server.html#redactions says:
+/* _REDACT_KEEP_KEY_MAP gives the keys we keep when an event is redacted
  *
- * the server should strip off any keys not in the following list:
- *    event_id
- *    type
- *    room_id
- *    user_id
- *    state_key
- *    prev_state
- *    content
- *    [we keep 'unsigned' as well, since that is created by the local server]
+ * This is specified here:
+ *  http://matrix.org/speculator/spec/HEAD/client_server/unstable.html#redactions
  *
- * The content object should also be stripped of all keys, unless it is one of
- * one of the following event types:
- *    m.room.member allows key membership
- *    m.room.create allows key creator
- *    m.room.join_rules allows key join_rule
- *    m.room.power_levels allows keys ban, events, events_default, kick,
- *        redact, state_default, users, users_default.
- *    m.room.aliases allows key aliases
+ * Also:
+ *  - We keep 'unsigned' since that is created by the local server
+ *  - We keep user_id for backwards-compat with v1
  */
-// a map giving the keys we keep when an event is redacted
-var _REDACT_KEEP_KEY_MAP = ['event_id', 'type', 'room_id', 'user_id', 'state_key', 'prev_state', 'content', 'unsigned'].reduce(function (ret, val) {
+var _REDACT_KEEP_KEY_MAP = ['event_id', 'type', 'room_id', 'user_id', 'sender', 'state_key', 'prev_state', 'content', 'unsigned', 'origin_server_ts'].reduce(function (ret, val) {
     ret[val] = 1;return ret;
 }, {});
 
@@ -10741,7 +12499,7 @@ var _REDACT_KEEP_CONTENT_MAP = {
  *    The matrix event which has been decrypted
  */
 
-},{"../utils.js":36,"events":46}],22:[function(require,module,exports){
+},{"../utils.js":44,"events":48}],25:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -11025,7 +12783,7 @@ module.exports = RoomMember;
  * });
  */
 
-},{"../content-repo":4,"../utils":36,"events":46}],23:[function(require,module,exports){
+},{"../content-repo":4,"../utils":44,"events":48}],26:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -11270,6 +13028,45 @@ RoomState.prototype.getUserIdsWithDisplayName = function (displayName) {
 };
 
 /**
+ * Returns true if userId is in room, event is not redacted and either sender of
+ * mxEvent or has power level sufficient to redact events other than their own.
+ * @param {MatrixEvent} mxEvent The event to test permission for
+ * @param {string} userId The user ID of the user to test permission for
+ * @return {boolean} true if the given used ID can redact given event
+ */
+RoomState.prototype.maySendRedactionForEvent = function (mxEvent, userId) {
+    var member = this.getMember(userId);
+    if (!member || member.membership === 'leave') return false;
+
+    if (mxEvent.status || mxEvent.isRedacted()) return false;
+    if (mxEvent.getSender() === userId) return true;
+
+    return this._hasSufficientPowerLevelFor('redact', member.powerLevel);
+};
+
+/**
+ * Returns true if the given power level is sufficient for action
+ * @param {string} action The type of power level to check
+ * @param {number} powerLevel The power level of the member
+ * @return {boolean} true if the given power level is sufficient
+ */
+RoomState.prototype._hasSufficientPowerLevelFor = function (action, powerLevel) {
+    var powerLevelsEvent = this.getStateEvents('m.room.power_levels', '');
+
+    var powerLevels = {};
+    if (powerLevelsEvent) {
+        powerLevels = powerLevelsEvent.getContent();
+    }
+
+    var requiredLevel = 50;
+    if (powerLevels[action] !== undefined) {
+        requiredLevel = powerLevels[action];
+    }
+
+    return powerLevel >= requiredLevel;
+};
+
+/**
  * Short-form for maySendEvent('m.room.message', userId)
  * @param {string} userId The user ID of the user to test permission for
  * @return {boolean} true if the given user ID should be permitted to send
@@ -11452,7 +13249,7 @@ function _updateDisplayNameCache(roomState, userId, displayName) {
 * });
 */
 
-},{"../utils":36,"./room-member":22,"events":46}],24:[function(require,module,exports){
+},{"../utils":44,"./room-member":25,"events":48}],27:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -11497,7 +13294,7 @@ function RoomSummary(roomId, info) {
  */
 module.exports = RoomSummary;
 
-},{}],25:[function(require,module,exports){
+},{}],28:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -11517,6 +13314,12 @@ limitations under the License.
 /**
  * @module models/room
  */
+
+var _reemit = require("../reemit");
+
+var _reemit2 = _interopRequireDefault(_reemit);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
 var EventEmitter = require("events").EventEmitter;
 
@@ -11648,7 +13451,7 @@ function Room(roomId, opts) {
     // all our per-room timeline sets. the first one is the unfiltered ones;
     // the subsequent ones are the filtered ones in no particular order.
     this._timelineSets = [new EventTimelineSet(this, opts)];
-    reEmit(this, this.getUnfilteredTimelineSet(), ["Room.timeline", "Room.timelineReset"]);
+    (0, _reemit2.default)(this, this.getUnfilteredTimelineSet(), ["Room.timeline", "Room.timelineReset"]);
 
     this._fixUpLegacyTimelineFields();
 
@@ -11660,6 +13463,8 @@ function Room(roomId, opts) {
     if (this._opts.pendingEventOrdering == "detached") {
         this._pendingEventList = [];
     }
+
+    this._blacklistUnverifiedDevices = false; // read by megolm
 }
 utils.inherits(Room, EventEmitter);
 
@@ -11694,10 +13499,12 @@ Room.prototype.getLiveTimeline = function () {
  * <p>This is used when /sync returns a 'limited' timeline.
  *
  * @param {string=} backPaginationToken   token for back-paginating the new timeline
+ * @param {boolean=} flush True to remove all events in all timelines. If false, only
+ * the live timeline is reset.
  */
-Room.prototype.resetLiveTimeline = function (backPaginationToken) {
+Room.prototype.resetLiveTimeline = function (backPaginationToken, flush) {
     for (var i = 0; i < this._timelineSets.length; i++) {
-        this._timelineSets[i].resetLiveTimeline(backPaginationToken);
+        this._timelineSets[i].resetLiveTimeline(backPaginationToken, flush);
     }
 
     this._fixUpLegacyTimelineFields();
@@ -11782,6 +13589,24 @@ Room.prototype.getUnreadNotificationCount = function (type) {
  */
 Room.prototype.setUnreadNotificationCount = function (type, count) {
     this._notificationCounts[type] = count;
+};
+
+/**
+ * Whether to send encrypted messages to devices within this room.
+ * Will be ignored if MatrixClient's blacklistUnverifiedDevices setting is true.
+ * @param {boolean} value if true, blacklist unverified devices.
+ */
+Room.prototype.setBlacklistUnverifiedDevices = function (value) {
+    this._blacklistUnverifiedDevices = value;
+};
+
+/**
+ * Whether to send encrypted messages to devices within this room.
+ * Will be ignored if MatrixClient's blacklistUnverifiedDevices setting is true.
+ * @return {boolean} true if blacklisting unverified devices.
+ */
+Room.prototype.getBlacklistUnverifiedDevices = function () {
+    return this._blacklistUnverifiedDevices;
 };
 
 /**
@@ -11941,7 +13766,7 @@ Room.prototype.getOrCreateFilteredTimelineSet = function (filter) {
     }
     var opts = Object.assign({ filter: filter }, this._opts);
     var timelineSet = new EventTimelineSet(this, opts);
-    reEmit(this, timelineSet, ["Room.timeline", "Room.timelineReset"]);
+    (0, _reemit2.default)(this, timelineSet, ["Room.timeline", "Room.timelineReset"]);
     this._filteredTimelineSets[filter.filterId] = timelineSet;
     this._timelineSets.push(timelineSet);
 
@@ -12577,7 +14402,7 @@ function calculateRoomName(room, userId, ignoreRoomNameEvent) {
 
     // get members that are NOT ourselves and are actually in the room.
     var otherMembers = utils.filter(room.currentState.getMembers(), function (m) {
-        return m.userId !== userId && m.membership !== "leave";
+        return m.userId !== userId && m.membership !== "leave" && m.membership !== "ban";
     });
     var allMembers = utils.filter(room.currentState.getMembers(), function (m) {
         return m.membership !== "leave";
@@ -12634,25 +14459,6 @@ function calculateRoomName(room, userId, ignoreRoomNameEvent) {
     } else {
         return otherMembers[0].name + " and " + (otherMembers.length - 1) + " others";
     }
-}
-
-// FIXME: copypasted from sync.js
-function reEmit(reEmitEntity, emittableEntity, eventNames) {
-    utils.forEach(eventNames, function (eventName) {
-        // setup a listener on the entity (the Room, User, etc) for this event
-        emittableEntity.on(eventName, function () {
-            // take the args from the listener and reuse them, adding the
-            // event name to the arg list so it works with .emit()
-            // Transformation Example:
-            // listener on "foo" => function(a,b) { ... }
-            // Re-emit on "thing" => thing.emit("foo", a, b)
-            var newArgs = [eventName];
-            for (var i = 0; i < arguments.length; i++) {
-                newArgs.push(arguments[i]);
-            }
-            reEmitEntity.emit.apply(reEmitEntity, newArgs);
-        });
-    });
 }
 
 /**
@@ -12752,7 +14558,7 @@ module.exports = Room;
  * @param {EventStatus} oldStatus The previous event status.
  */
 
-},{"../content-repo":4,"../utils":36,"./event":21,"./event-timeline":20,"./event-timeline-set":19,"./room-summary":24,"events":46}],26:[function(require,module,exports){
+},{"../content-repo":4,"../reemit":33,"../utils":44,"./event":24,"./event-timeline":23,"./event-timeline-set":22,"./room-summary":27,"events":48}],29:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -12819,7 +14625,7 @@ SearchResult.fromJson = function (jsonObj, eventMapper) {
  */
 module.exports = SearchResult;
 
-},{"../utils":36,"./event-context":18}],27:[function(require,module,exports){
+},{"../utils":44,"./event-context":21}],30:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -13058,7 +14864,7 @@ module.exports = User;
  * });
  */
 
-},{"../utils":36,"events":46}],28:[function(require,module,exports){
+},{"../utils":44,"events":48}],31:[function(require,module,exports){
 'use strict';
 
 var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
@@ -13403,7 +15209,7 @@ PushProcessor.actionListToActionsObject = function (actionlist) {
 /** The PushProcessor class. */
 module.exports = PushProcessor;
 
-},{}],29:[function(require,module,exports){
+},{}],32:[function(require,module,exports){
 (function (global){
 /*
 Copyright 2016 OpenMarket Ltd
@@ -13573,7 +15379,7 @@ function _runCallbacks() {
     for (var i = 0; i < callbacksToRun.length; i++) {
         cb = callbacksToRun[i];
         try {
-            cb.func.apply(null, cb.params);
+            cb.func.apply(global, cb.params);
         } catch (e) {
             console.error("Uncaught exception in callback function", e.stack || e);
         }
@@ -13607,7 +15413,88 @@ function binarySearch(array, func) {
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{}],30:[function(require,module,exports){
+},{}],33:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+    value: true
+});
+exports.default = reEmit;
+/*
+Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+/**
+ * @module
+ */
+
+/**
+ * re-emit events raised by one EventEmitter from another
+ *
+ * @param {external:EventEmitter} reEmitEntity
+ *     entity from which we want events to be emitted
+ * @param {external:EventEmitter} emittableEntity
+ *     entity from which events are currently emitted
+ * @param {Array<string>} eventNames
+ *     list of events to be reemitted
+ */
+function reEmit(reEmitEntity, emittableEntity, eventNames) {
+    var _iteratorNormalCompletion = true;
+    var _didIteratorError = false;
+    var _iteratorError = undefined;
+
+    try {
+        var _loop = function _loop() {
+            var eventName = _step.value;
+
+            // setup a listener on the entity (the Room, User, etc) for this event
+            emittableEntity.on(eventName, function () {
+                for (var _len = arguments.length, args = Array(_len), _key = 0; _key < _len; _key++) {
+                    args[_key] = arguments[_key];
+                }
+
+                // take the args from the listener and reuse them, adding the
+                // event name to the arg list so it works with .emit()
+                // Transformation Example:
+                // listener on "foo" => function(a,b) { ... }
+                // Re-emit on "thing" => thing.emit("foo", a, b)
+                reEmitEntity.emit.apply(reEmitEntity, [eventName].concat(args));
+            });
+        };
+
+        for (var _iterator = eventNames[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+            _loop();
+        }
+    } catch (err) {
+        _didIteratorError = true;
+        _iteratorError = err;
+    } finally {
+        try {
+            if (!_iteratorNormalCompletion && _iterator.return) {
+                _iterator.return();
+            }
+        } finally {
+            if (_didIteratorError) {
+                throw _iteratorError;
+            }
+        }
+    }
+}
+
+},{}],34:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -13914,9 +15801,777 @@ function debuglog() {
  */
 module.exports = MatrixScheduler;
 
-},{"./utils":36,"q":42}],31:[function(require,module,exports){
+},{"./utils":44,"q":51}],35:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+    value: true
+});
+
+var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }(); /*
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         Copyright 2017 Vector Creations Ltd
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         Licensed under the Apache License, Version 2.0 (the "License");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         you may not use this file except in compliance with the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         You may obtain a copy of the License at
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             http://www.apache.org/licenses/LICENSE-2.0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         Unless required by applicable law or agreed to in writing, software
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         distributed under the License is distributed on an "AS IS" BASIS,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         See the License for the specific language governing permissions and
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         limitations under the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         */
+
+var _q = require("q");
+
+var _q2 = _interopRequireDefault(_q);
+
+var _syncAccumulator = require("../sync-accumulator");
+
+var _syncAccumulator2 = _interopRequireDefault(_syncAccumulator);
+
+var _utils = require("../utils");
+
+var _utils2 = _interopRequireDefault(_utils);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+var VERSION = 1;
+
+function createDatabase(db) {
+    // Make user store, clobber based on user ID. (userId property of User objects)
+    db.createObjectStore("users", { keyPath: ["userId"] });
+
+    // Make account data store, clobber based on event type.
+    // (event.type property of MatrixEvent objects)
+    db.createObjectStore("accountData", { keyPath: ["type"] });
+
+    // Make /sync store (sync tokens, room data, etc), always clobber (const key).
+    db.createObjectStore("sync", { keyPath: ["clobber"] });
+}
+
+/**
+ * Helper method to collect results from a Cursor and promiseify it.
+ * @param {ObjectStore|Index} store The store to perform openCursor on.
+ * @param {IDBKeyRange=} keyRange Optional key range to apply on the cursor.
+ * @param {Function} resultMapper A function which is repeatedly called with a
+ * Cursor.
+ * Return the data you want to keep.
+ * @return {Promise<T[]>} Resolves to an array of whatever you returned from
+ * resultMapper.
+ */
+function selectQuery(store, keyRange, resultMapper) {
+    var query = store.openCursor(keyRange);
+    return _q2.default.Promise(function (resolve, reject) {
+        /*eslint new-cap: 0*/
+        var results = [];
+        query.onerror = function (event) {
+            reject(new Error("Query failed: " + event.target.errorCode));
+        };
+        // collect results
+        query.onsuccess = function (event) {
+            var cursor = event.target.result;
+            if (!cursor) {
+                resolve(results);
+                return; // end of results
+            }
+            results.push(resultMapper(cursor));
+            cursor.continue();
+        };
+    });
+}
+
+function promiseifyTxn(txn) {
+    return new _q2.default.Promise(function (resolve, reject) {
+        txn.oncomplete = function (event) {
+            resolve(event);
+        };
+        txn.onerror = function (event) {
+            reject(event);
+        };
+    });
+}
+
+function promiseifyRequest(req) {
+    return new _q2.default.Promise(function (resolve, reject) {
+        req.onsuccess = function (event) {
+            resolve(event);
+        };
+        req.onerror = function (event) {
+            reject(event);
+        };
+    });
+}
+
+/**
+ * Does the actual reading from and writing to the indexeddb
+ *
+ * Construct a new Indexed Database store backend. This requires a call to
+ * <code>connect()</code> before this store can be used.
+ * @constructor
+ * @param {Object} indexedDBInterface The Indexed DB interface e.g
+ * <code>window.indexedDB</code>
+ * @param {string=} dbName Optional database name. The same name must be used
+ * to open the same database.
+ */
+var LocalIndexedDBStoreBackend = function LocalIndexedDBStoreBackend(indexedDBInterface, dbName) {
+    this.indexedDB = indexedDBInterface;
+    this._dbName = "matrix-js-sdk:" + (dbName || "default");
+    this.db = null;
+    this._syncAccumulator = new _syncAccumulator2.default();
+};
+
+LocalIndexedDBStoreBackend.prototype = {
+    /**
+     * Attempt to connect to the database. This can fail if the user does not
+     * grant permission.
+     * @return {Promise} Resolves if successfully connected.
+     */
+    connect: function connect() {
+        var _this = this;
+
+        if (this.db) {
+            return (0, _q2.default)();
+        }
+        var req = this.indexedDB.open(this._dbName, VERSION);
+        req.onupgradeneeded = function (ev) {
+            var db = ev.target.result;
+            var oldVersion = ev.oldVersion;
+            if (oldVersion < 1) {
+                // The database did not previously exist.
+                createDatabase(db);
+            }
+            // Expand as needed.
+        };
+
+        return promiseifyRequest(req).then(function (ev) {
+            _this.db = ev.target.result;
+
+            // add a poorly-named listener for when deleteDatabase is called
+            // so we can close our db connections.
+            _this.db.onversionchange = function () {
+                _this.db.close();
+            };
+
+            return _this._init();
+        });
+    },
+
+    /**
+     * Having connected, load initial data from the database and prepare for use
+     * @return {Promise} Resolves on success
+     */
+    _init: function _init() {
+        var _this2 = this;
+
+        return _q2.default.all([this._loadAccountData(), this._loadSyncData()]).then(function (_ref) {
+            var _ref2 = _slicedToArray(_ref, 2),
+                accountData = _ref2[0],
+                syncData = _ref2[1];
+
+            _this2._syncAccumulator.accumulate({
+                next_batch: syncData.nextBatch,
+                rooms: syncData.roomsData,
+                account_data: {
+                    events: accountData
+                }
+            });
+        });
+    },
+
+    /**
+     * Clear the entire database. This should be used when logging out of a client
+     * to prevent mixing data between accounts.
+     * @return {Promise} Resolved when the database is cleared.
+     */
+    clearDatabase: function clearDatabase() {
+        console.log("Removing indexeddb instance: ", this._dbName);
+        return promiseifyRequest(this.indexedDB.deleteDatabase(this._dbName));
+    },
+
+    /**
+     * @param {boolean=} copy If false, the data returned is from internal
+     * buffers and must not be muated. Otherwise, a copy is made before
+     * returning such that the data can be safely mutated. Default: true.
+     *
+     * @return {Promise} Resolves with a sync response to restore the
+     * client state to where it was at the last save, or null if there
+     * is no saved sync data.
+     */
+    getSavedSync: function getSavedSync(copy) {
+        if (copy === undefined) copy = true;
+
+        var data = this._syncAccumulator.getJSON();
+        if (!data.nextBatch) return (0, _q2.default)(null);
+        if (copy) {
+            // We must deep copy the stored data so that the /sync processing code doesn't
+            // corrupt the internal state of the sync accumulator (it adds non-clonable keys)
+            return (0, _q2.default)(_utils2.default.deepCopy(data));
+        } else {
+            return (0, _q2.default)(data);
+        }
+    },
+
+    setSyncData: function setSyncData(syncData) {
+        var _this3 = this;
+
+        return (0, _q2.default)().then(function () {
+            _this3._syncAccumulator.accumulate(syncData);
+        });
+    },
+
+    syncToDatabase: function syncToDatabase(userTuples) {
+        var syncData = this._syncAccumulator.getJSON();
+
+        return _q2.default.all([this._persistUserPresenceEvents(userTuples), this._persistAccountData(syncData.accountData), this._persistSyncData(syncData.nextBatch, syncData.roomsData)]);
+    },
+
+    /**
+     * Persist rooms /sync data along with the next batch token.
+     * @param {string} nextBatch The next_batch /sync value.
+     * @param {Object} roomsData The 'rooms' /sync data from a SyncAccumulator
+     * @return {Promise} Resolves if the data was persisted.
+     */
+    _persistSyncData: function _persistSyncData(nextBatch, roomsData) {
+        var _this4 = this;
+
+        console.log("Persisting sync data up to ", nextBatch);
+        return _q2.default.try(function () {
+            var txn = _this4.db.transaction(["sync"], "readwrite");
+            var store = txn.objectStore("sync");
+            store.put({
+                clobber: "-", // constant key so will always clobber
+                nextBatch: nextBatch,
+                roomsData: roomsData
+            }); // put == UPSERT
+            return promiseifyTxn(txn);
+        });
+    },
+
+    /**
+     * Persist a list of account data events. Events with the same 'type' will
+     * be replaced.
+     * @param {Object[]} accountData An array of raw user-scoped account data events
+     * @return {Promise} Resolves if the events were persisted.
+     */
+    _persistAccountData: function _persistAccountData(accountData) {
+        var _this5 = this;
+
+        return _q2.default.try(function () {
+            var txn = _this5.db.transaction(["accountData"], "readwrite");
+            var store = txn.objectStore("accountData");
+            for (var i = 0; i < accountData.length; i++) {
+                store.put(accountData[i]); // put == UPSERT
+            }
+            return promiseifyTxn(txn);
+        });
+    },
+
+    /**
+     * Persist a list of [user id, presence event] they are for.
+     * Users with the same 'userId' will be replaced.
+     * Presence events should be the event in its raw form (not the Event
+     * object)
+     * @param {Object[]} tuples An array of [userid, event] tuples
+     * @return {Promise} Resolves if the users were persisted.
+     */
+    _persistUserPresenceEvents: function _persistUserPresenceEvents(tuples) {
+        var _this6 = this;
+
+        return _q2.default.try(function () {
+            var txn = _this6.db.transaction(["users"], "readwrite");
+            var store = txn.objectStore("users");
+            var _iteratorNormalCompletion = true;
+            var _didIteratorError = false;
+            var _iteratorError = undefined;
+
+            try {
+                for (var _iterator = tuples[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+                    var tuple = _step.value;
+
+                    store.put({
+                        userId: tuple[0],
+                        event: tuple[1]
+                    }); // put == UPSERT
+                }
+            } catch (err) {
+                _didIteratorError = true;
+                _iteratorError = err;
+            } finally {
+                try {
+                    if (!_iteratorNormalCompletion && _iterator.return) {
+                        _iterator.return();
+                    }
+                } finally {
+                    if (_didIteratorError) {
+                        throw _iteratorError;
+                    }
+                }
+            }
+
+            return promiseifyTxn(txn);
+        });
+    },
+
+    /**
+     * Load all user presence events from the database. This is not cached.
+     * FIXME: It would probably be more sensible to store the events in the
+     * sync.
+     * @return {Promise<Object[]>} A list of presence events in their raw form.
+     */
+    getUserPresenceEvents: function getUserPresenceEvents() {
+        var _this7 = this;
+
+        return _q2.default.try(function () {
+            var txn = _this7.db.transaction(["users"], "readonly");
+            var store = txn.objectStore("users");
+            return selectQuery(store, undefined, function (cursor) {
+                return [cursor.value.userId, cursor.value.event];
+            });
+        });
+    },
+
+    /**
+     * Load all the account data events from the database. This is not cached.
+     * @return {Promise<Object[]>} A list of raw global account events.
+     */
+    _loadAccountData: function _loadAccountData() {
+        var _this8 = this;
+
+        return _q2.default.try(function () {
+            var txn = _this8.db.transaction(["accountData"], "readonly");
+            var store = txn.objectStore("accountData");
+            return selectQuery(store, undefined, function (cursor) {
+                return cursor.value;
+            });
+        });
+    },
+
+    /**
+     * Load the sync data from the database.
+     * @return {Promise<Object>} An object with "roomsData" and "nextBatch" keys.
+     */
+    _loadSyncData: function _loadSyncData() {
+        var _this9 = this;
+
+        return _q2.default.try(function () {
+            var txn = _this9.db.transaction(["sync"], "readonly");
+            var store = txn.objectStore("sync");
+            return selectQuery(store, undefined, function (cursor) {
+                return cursor.value;
+            }).then(function (results) {
+                if (results.length > 1) {
+                    console.warn("loadSyncData: More than 1 sync row found.");
+                }
+                return results.length > 0 ? results[0] : {};
+            });
+        });
+    }
+};
+
+exports.default = LocalIndexedDBStoreBackend;
+
+},{"../sync-accumulator":41,"../utils":44,"q":51}],36:[function(require,module,exports){
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+    value: true
+});
+
+var _q = require("q");
+
+var _q2 = _interopRequireDefault(_q);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+/**
+ * An IndexedDB store backend where the actual backend sits in a web
+ * worker.
+ *
+ * Construct a new Indexed Database store backend. This requires a call to
+ * <code>connect()</code> before this store can be used.
+ * @constructor
+ * @param {string} workerScript URL to the worker script
+ * @param {string=} dbName Optional database name. The same name must be used
+ * to open the same database.
+ * @param {Object} WorkerApi The web worker compatible interface object
+ */
+var RemoteIndexedDBStoreBackend = function RemoteIndexedDBStoreBackend(workerScript, dbName, WorkerApi) {
+    this._dbName = dbName;
+    this._worker = new WorkerApi(workerScript);
+    this._nextSeq = 0;
+    // The currently in-flight requests to the actual backend
+    this._inFlight = {
+        // seq: promise,
+    };
+
+    this._worker.onmessage = this._onWorkerMessage.bind(this);
+}; /*
+   Copyright 2017 Vector Creations Ltd
+   
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+   
+       http://www.apache.org/licenses/LICENSE-2.0
+   
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+   */
+
+RemoteIndexedDBStoreBackend.prototype = {
+    /**
+     * Attempt to connect to the database. This can fail if the user does not
+     * grant permission.
+     * @return {Promise} Resolves if successfully connected.
+     */
+    connect: function connect() {
+        var _this = this;
+
+        return this._doCmd('_setupWorker', [this._dbName]).then(function () {
+            console.log("IndexedDB worker is ready");
+            return _this._doCmd('connect');
+        });
+    },
+
+    /**
+     * Clear the entire database. This should be used when logging out of a client
+     * to prevent mixing data between accounts.
+     * @return {Promise} Resolved when the database is cleared.
+     */
+    clearDatabase: function clearDatabase() {
+        return this._doCmd('clearDatabase');
+    },
+
+    /**
+     * @return {Promise} Resolves with a sync response to restore the
+     * client state to where it was at the last save, or null if there
+     * is no saved sync data.
+     */
+    getSavedSync: function getSavedSync() {
+        return this._doCmd('getSavedSync');
+    },
+
+    setSyncData: function setSyncData(syncData) {
+        return this._doCmd('setSyncData', [syncData]);
+    },
+
+    syncToDatabase: function syncToDatabase(users) {
+        return this._doCmd('syncToDatabase', [users]);
+    },
+
+    /**
+     * Load all user presence events from the database. This is not cached.
+     * @return {Promise<Object[]>} A list of presence events in their raw form.
+     */
+    getUserPresenceEvents: function getUserPresenceEvents() {
+        return this._doCmd('getUserPresenceEvents');
+    },
+
+    _doCmd: function _doCmd(cmd, args) {
+        var _this2 = this;
+
+        // wrap in a q so if the postMessage throws,
+        // the promise automatically gets rejected
+        return (0, _q2.default)().then(function () {
+            var seq = _this2._nextSeq++;
+            var def = _q2.default.defer();
+
+            _this2._inFlight[seq] = def;
+
+            _this2._worker.postMessage({
+                command: cmd,
+                seq: seq,
+                args: args
+            });
+
+            return def.promise;
+        });
+    },
+
+    _onWorkerMessage: function _onWorkerMessage(ev) {
+        var msg = ev.data;
+
+        if (msg.command == 'cmd_success' || msg.command == 'cmd_fail') {
+            if (msg.seq === undefined) {
+                console.error("Got reply from worker with no seq");
+                return;
+            }
+
+            var def = this._inFlight[msg.seq];
+            if (def === undefined) {
+                console.error("Got reply for unknown seq " + msg.seq);
+                return;
+            }
+            delete this._inFlight[msg.seq];
+
+            if (msg.command == 'cmd_success') {
+                def.resolve(msg.result);
+            } else {
+                def.reject(msg.error);
+            }
+        } else {
+            console.warn("Unrecognised message from worker: " + msg);
+        }
+    }
+};
+
+exports.default = RemoteIndexedDBStoreBackend;
+
+},{"q":51}],37:[function(require,module,exports){
+(function (global){
+"use strict";
+
+var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }(); /*
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         Copyright 2017 Vector Creations Ltd
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         Licensed under the Apache License, Version 2.0 (the "License");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         you may not use this file except in compliance with the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         You may obtain a copy of the License at
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             http://www.apache.org/licenses/LICENSE-2.0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         Unless required by applicable law or agreed to in writing, software
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         distributed under the License is distributed on an "AS IS" BASIS,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         See the License for the specific language governing permissions and
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         limitations under the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         */
+
+var _q = require("q");
+
+var _q2 = _interopRequireDefault(_q);
+
+var _memory = require("./memory");
+
+var _utils = require("../utils");
+
+var _utils2 = _interopRequireDefault(_utils);
+
+var _indexeddbLocalBackend = require("./indexeddb-local-backend.js");
+
+var _indexeddbLocalBackend2 = _interopRequireDefault(_indexeddbLocalBackend);
+
+var _indexeddbRemoteBackend = require("./indexeddb-remote-backend.js");
+
+var _indexeddbRemoteBackend2 = _interopRequireDefault(_indexeddbRemoteBackend);
+
+var _user = require("../models/user");
+
+var _user2 = _interopRequireDefault(_user);
+
+var _event = require("../models/event");
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+/**
+ * This is an internal module. See {@link IndexedDBStore} for the public class.
+ * @module store/indexeddb
+ */
+
+// If this value is too small we'll be writing very often which will cause
+// noticable stop-the-world pauses. If this value is too big we'll be writing
+// so infrequently that the /sync size gets bigger on reload. Writing more
+// often does not affect the length of the pause since the entire /sync
+// response is persisted each time.
+var WRITE_DELAY_MS = 1000 * 60 * 5; // once every 5 minutes
+
+
+/**
+ * Construct a new Indexed Database store, which extends MatrixInMemoryStore.
+ *
+ * This store functions like a MatrixInMemoryStore except it periodically persists
+ * the contents of the store to an IndexedDB backend.
+ *
+ * All data is still kept in-memory but can be loaded from disk by calling
+ * <code>startup()</code>. This can make startup times quicker as a complete
+ * sync from the server is not required. This does not reduce memory usage as all
+ * the data is eagerly fetched when <code>startup()</code> is called.
+ * <pre>
+ * let opts = { localStorage: window.localStorage };
+ * let store = new IndexedDBStore();
+ * await store.startup(); // load from indexed db
+ * let client = sdk.createClient({
+ *     store: store,
+ * });
+ * client.startClient();
+ * client.on("sync", function(state, prevState, data) {
+ *     if (state === "PREPARED") {
+ *         console.log("Started up, now with go faster stripes!");
+ *     }
+ * });
+ * </pre>
+ *
+ * @constructor
+ * @extends MatrixInMemoryStore
+ * @param {Object} opts Options object.
+ * @param {Object} opts.indexedDB The Indexed DB interface e.g.
+ * <code>window.indexedDB</code>
+ * @param {string=} opts.dbName Optional database name. The same name must be used
+ * to open the same database.
+ * @param {string=} opts.workerScript Optional URL to a script to invoke a web
+ * worker with to run IndexedDB queries on the web worker. The IndexedDbStoreWorker
+ * class is provided for this purpose and requires the application to provide a
+ * trivial wrapper script around it.
+ * @param {Object=} opts.workerApi The webWorker API object. If omitted, the global Worker
+ * object will be used if it exists.
+ * @prop {IndexedDBStoreBackend} backend The backend instance. Call through to
+ * this API if you need to perform specific indexeddb actions like deleting the
+ * database.
+ */
+var IndexedDBStore = function IndexedDBStore(opts) {
+    _memory.MatrixInMemoryStore.call(this, opts);
+
+    if (!opts.indexedDB) {
+        throw new Error('Missing required option: indexedDB');
+    }
+
+    if (opts.workerScript) {
+        // try & find a webworker-compatible API
+        var workerApi = opts.workerApi;
+        if (!workerApi) {
+            // default to the global Worker object (which is where it in a browser)
+            workerApi = global.Worker;
+        }
+        this.backend = new _indexeddbRemoteBackend2.default(opts.workerScript, opts.dbName, workerApi);
+    } else {
+        this.backend = new _indexeddbLocalBackend2.default(opts.indexedDB, opts.dbName);
+    }
+
+    this.startedUp = false;
+    this._syncTs = 0;
+
+    // Records the last-modified-time of each user at the last point we saved
+    // the database, such that we can derive the set if users that have been
+    // modified since we last saved.
+    this._userModifiedMap = {
+        // user_id : timestamp
+    };
+};
+_utils2.default.inherits(IndexedDBStore, _memory.MatrixInMemoryStore);
+
+/**
+ * @return {Promise} Resolved when loaded from indexed db.
+  */
+IndexedDBStore.prototype.startup = function () {
+    var _this = this;
+
+    if (this.startedUp) {
+        return (0, _q2.default)();
+    }
+
+    return this.backend.connect().then(function () {
+        return _this.backend.getUserPresenceEvents();
+    }).then(function (userPresenceEvents) {
+        userPresenceEvents.forEach(function (_ref) {
+            var _ref2 = _slicedToArray(_ref, 2),
+                userId = _ref2[0],
+                rawEvent = _ref2[1];
+
+            var u = new _user2.default(userId);
+            if (rawEvent) {
+                u.setPresenceEvent(new _event.MatrixEvent(rawEvent));
+            }
+            _this._userModifiedMap[u.userId] = u.getLastModifiedTime();
+            _this.storeUser(u);
+        });
+    });
+};
+
+/**
+ * @return {Promise} Resolves with a sync response to restore the
+ * client state to where it was at the last save, or null if there
+ * is no saved sync data.
+ */
+IndexedDBStore.prototype.getSavedSync = function () {
+    return this.backend.getSavedSync();
+};
+
+/**
+ * Delete all data from this store.
+ * @return {Promise} Resolves if the data was deleted from the database.
+ */
+IndexedDBStore.prototype.deleteAllData = function () {
+    _memory.MatrixInMemoryStore.prototype.deleteAllData.call(this);
+    return this.backend.clearDatabase().then(function () {
+        console.log("Deleted indexeddb data.");
+    }, function (err) {
+        console.error("Failed to delete indexeddb data: ", err);
+        throw err;
+    });
+};
+
+/**
+ * Possibly write data to the database.
+ * @return {Promise} Promise resolves after the write completes.
+ */
+IndexedDBStore.prototype.save = function () {
+    var now = Date.now();
+    if (now - this._syncTs > WRITE_DELAY_MS) {
+        return this._reallySave();
+    }
+    return (0, _q2.default)();
+};
+
+IndexedDBStore.prototype._reallySave = function () {
+    this._syncTs = Date.now(); // set now to guard against multi-writes
+
+    // work out changed users (this doesn't handle deletions but you
+    // can't 'delete' users as they are just presence events).
+    var userTuples = [];
+    var _iteratorNormalCompletion = true;
+    var _didIteratorError = false;
+    var _iteratorError = undefined;
+
+    try {
+        for (var _iterator = this.getUsers()[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+            var u = _step.value;
+
+            if (this._userModifiedMap[u.userId] === u.getLastModifiedTime()) continue;
+            if (!u.events.presence) continue;
+
+            userTuples.push([u.userId, u.events.presence.event]);
+
+            // note that we've saved this version of the user
+            this._userModifiedMap[u.userId] = u.getLastModifiedTime();
+        }
+    } catch (err) {
+        _didIteratorError = true;
+        _iteratorError = err;
+    } finally {
+        try {
+            if (!_iteratorNormalCompletion && _iterator.return) {
+                _iterator.return();
+            }
+        } finally {
+            if (_didIteratorError) {
+                throw _iteratorError;
+            }
+        }
+    }
+
+    return this.backend.syncToDatabase(userTuples).catch(function (err) {
+        console.error("sync fail:", err);
+    });
+};
+
+IndexedDBStore.prototype.setSyncData = function (syncData) {
+    return this.backend.setSyncData(syncData);
+};
+
+module.exports.IndexedDBStore = IndexedDBStore;
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{"../models/event":24,"../models/user":30,"../utils":44,"./indexeddb-local-backend.js":35,"./indexeddb-remote-backend.js":36,"./memory":38,"q":51}],38:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13938,6 +16593,7 @@ limitations under the License.
 
 var utils = require("../utils");
 var User = require("../models/user");
+var q = require("q");
 
 /**
  * Construct a new in-memory data store for the Matrix Client.
@@ -14188,11 +16844,65 @@ module.exports.MatrixInMemoryStore.prototype = {
      */
     getAccountData: function getAccountData(eventType) {
         return this.accountData[eventType];
-    }
+    },
 
+    /**
+     * setSyncData does nothing as there is no backing data store.
+     *
+     * @param {Object} syncData The sync data
+     * @return {Promise} An immediately resolved promise.
+     */
+    setSyncData: function setSyncData(syncData) {
+        return q();
+    },
+
+    /**
+     * Save does nothing as there is no backing data store.
+     */
+    save: function save() {},
+
+    /**
+     * Startup does nothing as this store doesn't require starting up.
+     * @return {Promise} An immediately resolved promise.
+     */
+    startup: function startup() {
+        return q();
+    },
+
+    /**
+     * @return {Promise} Resolves with a sync response to restore the
+     * client state to where it was at the last save, or null if there
+     * is no saved sync data.
+     */
+    getSavedSync: function getSavedSync() {
+        return q(null);
+    },
+
+    /**
+     * Delete all data from this store.
+     * @return {Promise} An immediately resolved promise.
+     */
+    deleteAllData: function deleteAllData() {
+        this.rooms = {
+            // roomId: Room
+        };
+        this.users = {
+            // userId: User
+        };
+        this.syncToken = null;
+        this.filters = {
+            // userId: {
+            //    filterId: Filter
+            // }
+        };
+        this.accountData = {
+            // type : content
+        };
+        return q();
+    }
 };
 
-},{"../models/user":27,"../utils":36}],32:[function(require,module,exports){
+},{"../models/user":30,"../utils":44,"q":51}],39:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -14287,6 +16997,35 @@ WebStorageSessionStore.prototype = {
         return getJsonItem(this.store, keyEndToEndDevicesForUser(userId));
     },
 
+    storeEndToEndDeviceTrackingStatus: function storeEndToEndDeviceTrackingStatus(statusMap) {
+        setJsonItem(this.store, KEY_END_TO_END_DEVICE_LIST_TRACKING_STATUS, statusMap);
+    },
+
+    getEndToEndDeviceTrackingStatus: function getEndToEndDeviceTrackingStatus() {
+        return getJsonItem(this.store, KEY_END_TO_END_DEVICE_LIST_TRACKING_STATUS);
+    },
+
+    /**
+     * Store the sync token corresponding to the device list.
+     *
+     * This is used when starting the client, to get a list of the users who
+     * have changed their device list since the list time we were running.
+     *
+     * @param {String?} token
+     */
+    storeEndToEndDeviceSyncToken: function storeEndToEndDeviceSyncToken(token) {
+        setJsonItem(this.store, KEY_END_TO_END_DEVICE_SYNC_TOKEN, token);
+    },
+
+    /**
+     * Get the sync token corresponding to the device list.
+     *
+     * @return {String?} token
+     */
+    getEndToEndDeviceSyncToken: function getEndToEndDeviceSyncToken() {
+        return getJsonItem(this.store, KEY_END_TO_END_DEVICE_SYNC_TOKEN);
+    },
+
     /**
      * Store a session between the logged-in user and another device
      * @param {string} deviceKey The public key of the other device.
@@ -14366,6 +17105,8 @@ WebStorageSessionStore.prototype = {
 
 var KEY_END_TO_END_ACCOUNT = E2E_PREFIX + "account";
 var KEY_END_TO_END_ANNOUNCED = E2E_PREFIX + "announced";
+var KEY_END_TO_END_DEVICE_SYNC_TOKEN = E2E_PREFIX + "device_sync_token";
+var KEY_END_TO_END_DEVICE_LIST_TRACKING_STATUS = E2E_PREFIX + "device_tracking";
 
 function keyEndToEndDevicesForUser(userId) {
     return E2E_PREFIX + "devices/" + userId;
@@ -14385,6 +17126,8 @@ function keyEndToEndRoom(roomId) {
 
 function getJsonItem(store, key) {
     try {
+        // if the key is absent, store.getItem() returns null, and
+        // JSON.parse(null) === null, so this returns null.
         return JSON.parse(store.getItem(key));
     } catch (e) {
         debuglog("Failed to get key %s: %s", key, e);
@@ -14408,9 +17151,10 @@ function debuglog() {
 /** */
 module.exports = WebStorageSessionStore;
 
-},{"../../utils":36}],33:[function(require,module,exports){
+},{"../../utils":44}],40:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14425,6 +17169,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 "use strict";
+
+var _q = require("q");
+
+var _q2 = _interopRequireDefault(_q);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
 /**
  * This is an internal module.
  * @module store/stub
@@ -14434,7 +17185,6 @@ limitations under the License.
  * Construct a stub store. This does no-ops on most store methods.
  * @constructor
  */
-
 function StubStore() {
   this.fromToken = null;
 }
@@ -14580,17 +17330,572 @@ StubStore.prototype = {
    * Get account data event by event type
    * @param {string} eventType The event type being queried
    */
-  getAccountData: function getAccountData(eventType) {}
+  getAccountData: function getAccountData(eventType) {},
 
+  /**
+   * setSyncData does nothing as there is no backing data store.
+   *
+   * @param {Object} syncData The sync data
+   * @return {Promise} An immediately resolved promise.
+   */
+  setSyncData: function setSyncData(syncData) {
+    return (0, _q2.default)();
+  },
+
+  /**
+   * Save does nothing as there is no backing data store.
+   */
+  save: function save() {},
+
+  /**
+   * Startup does nothing.
+   * @return {Promise} An immediately resolved promise.
+   */
+  startup: function startup() {
+    return (0, _q2.default)();
+  },
+
+  /**
+   * @return {Promise} Resolves with a sync response to restore the
+   * client state to where it was at the last save, or null if there
+   * is no saved sync data.
+   */
+  getSavedSync: function getSavedSync() {
+    return (0, _q2.default)(null);
+  },
+
+  /**
+   * Delete all data from this store. Does nothing since this store
+   * doesn't store anything.
+   * @return {Promise} An immediately resolved promise.
+   */
+  deleteAllData: function deleteAllData() {
+    return (0, _q2.default)();
+  }
 };
 
 /** Stub Store class. */
 module.exports = StubStore;
 
-},{}],34:[function(require,module,exports){
+},{"q":51}],41:[function(require,module,exports){
+"use strict";
+
+var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }(); /*
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Copyright 2017 Vector Creations Ltd
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Licensed under the Apache License, Version 2.0 (the "License");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     you may not use this file except in compliance with the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     You may obtain a copy of the License at
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         http://www.apache.org/licenses/LICENSE-2.0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     Unless required by applicable law or agreed to in writing, software
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     distributed under the License is distributed on an "AS IS" BASIS,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     See the License for the specific language governing permissions and
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     limitations under the License.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     */
+
+/**
+ * This is an internal module. See {@link SyncAccumulator} for the public class.
+ * @module sync-accumulator
+ */
+
+var _utils = require("./utils");
+
+var _utils2 = _interopRequireDefault(_utils);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+/**
+ * The purpose of this class is to accumulate /sync responses such that a
+ * complete "initial" JSON response can be returned which accurately represents
+ * the sum total of the /sync responses accumulated to date. It only handles
+ * room data: that is, everything under the "rooms" top-level key.
+ *
+ * This class is used when persisting room data so a complete /sync response can
+ * be loaded from disk and incremental syncs can be performed on the server,
+ * rather than asking the server to do an initial sync on startup.
+ */
+var SyncAccumulator = function () {
+
+    /**
+     * @param {Object} opts
+     * @param {Number=} opts.maxTimelineEntries The ideal maximum number of
+     * timeline entries to keep in the sync response. This is best-effort, as
+     * clients do not always have a back-pagination token for each event, so
+     * it's possible there may be slightly *less* than this value. There will
+     * never be more. This cannot be 0 or else it makes it impossible to scroll
+     * back in a room. Default: 50.
+     */
+    function SyncAccumulator(opts) {
+        _classCallCheck(this, SyncAccumulator);
+
+        opts = opts || {};
+        opts.maxTimelineEntries = opts.maxTimelineEntries || 50;
+        this.opts = opts;
+        this.accountData = {
+            //$event_type: Object
+        };
+        this.inviteRooms = {
+            //$roomId: { ... sync 'invite' json data ... }
+        };
+        this.joinRooms = {
+            //$roomId: {
+            //    _currentState: { $event_type: { $state_key: json } },
+            //    _timeline: [
+            //       { event: $event, token: null|token },
+            //       { event: $event, token: null|token },
+            //       { event: $event, token: null|token },
+            //       ...
+            //    ],
+            //    _accountData: { $event_type: json },
+            //    _unreadNotifications: { ... unread_notifications JSON ... },
+            //    _readReceipts: { $user_id: { data: $json, eventId: $event_id }}
+            //}
+        };
+        // the /sync token which corresponds to the last time rooms were
+        // accumulated. We remember this so that any caller can obtain a
+        // coherent /sync response and know at what point they should be
+        // streaming from without losing events.
+        this.nextBatch = null;
+    }
+
+    _createClass(SyncAccumulator, [{
+        key: "accumulate",
+        value: function accumulate(syncResponse) {
+            this._accumulateRooms(syncResponse);
+            this._accumulateAccountData(syncResponse);
+            this.nextBatch = syncResponse.next_batch;
+        }
+    }, {
+        key: "_accumulateAccountData",
+        value: function _accumulateAccountData(syncResponse) {
+            var _this = this;
+
+            if (!syncResponse.account_data || !syncResponse.account_data.events) {
+                return;
+            }
+            // Clobbers based on event type.
+            syncResponse.account_data.events.forEach(function (e) {
+                _this.accountData[e.type] = e;
+            });
+        }
+
+        /**
+         * Accumulate incremental /sync room data.
+         * @param {Object} syncResponse the complete /sync JSON
+         */
+
+    }, {
+        key: "_accumulateRooms",
+        value: function _accumulateRooms(syncResponse) {
+            var _this2 = this;
+
+            if (!syncResponse.rooms) {
+                return;
+            }
+            if (syncResponse.rooms.invite) {
+                Object.keys(syncResponse.rooms.invite).forEach(function (roomId) {
+                    _this2._accumulateRoom(roomId, "invite", syncResponse.rooms.invite[roomId]);
+                });
+            }
+            if (syncResponse.rooms.join) {
+                Object.keys(syncResponse.rooms.join).forEach(function (roomId) {
+                    _this2._accumulateRoom(roomId, "join", syncResponse.rooms.join[roomId]);
+                });
+            }
+            if (syncResponse.rooms.leave) {
+                Object.keys(syncResponse.rooms.leave).forEach(function (roomId) {
+                    _this2._accumulateRoom(roomId, "leave", syncResponse.rooms.leave[roomId]);
+                });
+            }
+        }
+    }, {
+        key: "_accumulateRoom",
+        value: function _accumulateRoom(roomId, category, data) {
+            // Valid /sync state transitions
+            //       +--------+ <======+            1: Accept an invite
+            //   +== | INVITE |        | (5)        2: Leave a room
+            //   |   +--------+ =====+ |            3: Join a public room previously
+            //   |(1)            (4) | |               left (handle as if new room)
+            //   V         (2)       V |            4: Reject an invite
+            // +------+ ========> +--------+         5: Invite to a room previously
+            // | JOIN |    (3)    | LEAVE* |            left (handle as if new room)
+            // +------+ <======== +--------+
+            //
+            // * equivalent to "no state"
+            switch (category) {
+                case "invite":
+                    // (5)
+                    this._accumulateInviteState(roomId, data);
+                    break;
+                case "join":
+                    if (this.inviteRooms[roomId]) {
+                        // (1)
+                        // was previously invite, now join. We expect /sync to give
+                        // the entire state and timeline on 'join', so delete previous
+                        // invite state
+                        delete this.inviteRooms[roomId];
+                    }
+                    // (3)
+                    this._accumulateJoinState(roomId, data);
+                    break;
+                case "leave":
+                    if (this.inviteRooms[roomId]) {
+                        // (4)
+                        delete this.inviteRooms[roomId];
+                    } else {
+                        // (2)
+                        delete this.joinRooms[roomId];
+                    }
+                    break;
+                default:
+                    console.error("Unknown cateogory: ", category);
+            }
+        }
+    }, {
+        key: "_accumulateInviteState",
+        value: function _accumulateInviteState(roomId, data) {
+            if (!data.invite_state || !data.invite_state.events) {
+                // no new data
+                return;
+            }
+            if (!this.inviteRooms[roomId]) {
+                this.inviteRooms[roomId] = {
+                    invite_state: data.invite_state
+                };
+                return;
+            }
+            // accumulate extra keys for invite->invite transitions
+            // clobber based on event type / state key
+            // We expect invite_state to be small, so just loop over the events
+            var currentData = this.inviteRooms[roomId];
+            data.invite_state.events.forEach(function (e) {
+                var hasAdded = false;
+                for (var i = 0; i < currentData.invite_state.events.length; i++) {
+                    var current = currentData.invite_state.events[i];
+                    if (current.type === e.type && current.state_key == e.state_key) {
+                        currentData.invite_state.events[i] = e; // update
+                        hasAdded = true;
+                    }
+                }
+                if (!hasAdded) {
+                    currentData.invite_state.events.push(e);
+                }
+            });
+        }
+
+        // Accumulate timeline and state events in a room.
+
+    }, {
+        key: "_accumulateJoinState",
+        value: function _accumulateJoinState(roomId, data) {
+            // We expect this function to be called a lot (every /sync) so we want
+            // this to be fast. /sync stores events in an array but we often want
+            // to clobber based on type/state_key. Rather than convert arrays to
+            // maps all the time, just keep private maps which contain
+            // the actual current accumulated sync state, and array-ify it when
+            // getJSON() is called.
+
+            // State resolution:
+            // The 'state' key is the delta from the previous sync (or start of time
+            // if no token was supplied), to the START of the timeline. To obtain
+            // the current state, we need to "roll forward" state by reading the
+            // timeline. We want to store the current state so we can drop events
+            // out the end of the timeline based on opts.maxTimelineEntries.
+            //
+            //      'state'     'timeline'     current state
+            // |-------x<======================>x
+            //          T   I   M   E
+            //
+            // When getJSON() is called, we 'roll back' the current state by the
+            // number of entries in the timeline to work out what 'state' should be.
+
+            // Back-pagination:
+            // On an initial /sync, the server provides a back-pagination token for
+            // the start of the timeline. When /sync deltas come down, they also
+            // include back-pagination tokens for the start of the timeline. This
+            // means not all events in the timeline have back-pagination tokens, as
+            // it is only the ones at the START of the timeline which have them.
+            // In order for us to have a valid timeline (and back-pagination token
+            // to match), we need to make sure that when we remove old timeline
+            // events, that we roll forward to an event which has a back-pagination
+            // token. This means we can't keep a strict sliding-window based on
+            // opts.maxTimelineEntries, and we may have a few less. We should never
+            // have more though, provided that the /sync limit is less than or equal
+            // to opts.maxTimelineEntries.
+
+            if (!this.joinRooms[roomId]) {
+                // Create truly empty objects so event types of 'hasOwnProperty' and co
+                // don't cause this code to break.
+                this.joinRooms[roomId] = {
+                    _currentState: Object.create(null),
+                    _timeline: [],
+                    _accountData: Object.create(null),
+                    _unreadNotifications: {},
+                    _readReceipts: {}
+                };
+            }
+            var currentData = this.joinRooms[roomId];
+
+            if (data.account_data && data.account_data.events) {
+                // clobber based on type
+                data.account_data.events.forEach(function (e) {
+                    currentData._accountData[e.type] = e;
+                });
+            }
+
+            // these probably clobber, spec is unclear.
+            if (data.unread_notifications) {
+                currentData._unreadNotifications = data.unread_notifications;
+            }
+
+            if (data.ephemeral && data.ephemeral.events) {
+                data.ephemeral.events.forEach(function (e) {
+                    // We purposefully do not persist m.typing events.
+                    // Technically you could refresh a browser before the timer on a
+                    // typing event is up, so it'll look like you aren't typing when
+                    // you really still are. However, the alternative is worse. If
+                    // we do persist typing events, it will look like people are
+                    // typing forever until someone really does start typing (which
+                    // will prompt Synapse to send down an actual m.typing event to
+                    // clobber the one we persisted).
+                    if (e.type !== "m.receipt" || !e.content) {
+                        // This means we'll drop unknown ephemeral events but that
+                        // seems okay.
+                        return;
+                    }
+                    // Handle m.receipt events. They clobber based on:
+                    //   (user_id, receipt_type)
+                    // but they are keyed in the event as:
+                    //   content:{ $event_id: { $receipt_type: { $user_id: {json} }}}
+                    // so store them in the former so we can accumulate receipt deltas
+                    // quickly and efficiently (we expect a lot of them). Fold the
+                    // receipt type into the key name since we only have 1 at the
+                    // moment (m.read) and nested JSON objects are slower and more
+                    // of a hassle to work with. We'll inflate this back out when
+                    // getJSON() is called.
+                    Object.keys(e.content).forEach(function (eventId) {
+                        if (!e.content[eventId]["m.read"]) {
+                            return;
+                        }
+                        Object.keys(e.content[eventId]["m.read"]).forEach(function (userId) {
+                            // clobber on user ID
+                            currentData._readReceipts[userId] = {
+                                data: e.content[eventId]["m.read"][userId],
+                                eventId: eventId
+                            };
+                        });
+                    });
+                });
+            }
+
+            // if we got a limited sync, we need to remove all timeline entries or else
+            // we will have gaps in the timeline.
+            if (data.timeline && data.timeline.limited) {
+                currentData._timeline = [];
+            }
+
+            // Work out the current state. The deltas need to be applied in the order:
+            // - existing state which didn't come down /sync.
+            // - State events under the 'state' key.
+            // - State events in the 'timeline'.
+            if (data.state && data.state.events) {
+                data.state.events.forEach(function (e) {
+                    setState(currentData._currentState, e);
+                });
+            }
+            if (data.timeline && data.timeline.events) {
+                data.timeline.events.forEach(function (e, index) {
+                    // this nops if 'e' isn't a state event
+                    setState(currentData._currentState, e);
+                    // append the event to the timeline. The back-pagination token
+                    // corresponds to the first event in the timeline
+                    currentData._timeline.push({
+                        event: e,
+                        token: index === 0 ? data.timeline.prev_batch : null
+                    });
+                });
+            }
+
+            // attempt to prune the timeline by jumping between events which have
+            // pagination tokens.
+            if (currentData._timeline.length > this.opts.maxTimelineEntries) {
+                var startIndex = currentData._timeline.length - this.opts.maxTimelineEntries;
+                for (var i = startIndex; i < currentData._timeline.length; i++) {
+                    if (currentData._timeline[i].token) {
+                        // keep all events after this, including this one
+                        currentData._timeline = currentData._timeline.slice(i, currentData._timeline.length);
+                        break;
+                    }
+                }
+            }
+        }
+
+        /**
+         * Return everything under the 'rooms' key from a /sync response which
+         * represents all room data that should be stored. This should be paired
+         * with the sync token which represents the most recent /sync response
+         * provided to accumulate().
+         * @return {Object} An object with a "nextBatch", "roomsData" and "accountData"
+         * keys.
+         * The "nextBatch" key is a string which represents at what point in the
+         * /sync stream the accumulator reached. This token should be used when
+         * restarting a /sync stream at startup. Failure to do so can lead to missing
+         * events. The "roomsData" key is an Object which represents the entire
+         * /sync response from the 'rooms' key onwards. The "accountData" key is
+         * a list of raw events which represent global account data.
+         */
+
+    }, {
+        key: "getJSON",
+        value: function getJSON() {
+            var _this3 = this;
+
+            var data = {
+                join: {},
+                invite: {},
+                // always empty. This is set by /sync when a room was previously
+                // in 'invite' or 'join'. On fresh startup, the client won't know
+                // about any previous room being in 'invite' or 'join' so we can
+                // just omit mentioning it at all, even if it has previously come
+                // down /sync.
+                // The notable exception is when a client is kicked or banned:
+                // we may want to hold onto that room so the client can clearly see
+                // why their room has disappeared. We don't persist it though because
+                // it is unclear *when* we can safely remove the room from the DB.
+                // Instead, we assume that if you're loading from the DB, you've
+                // refreshed the page, which means you've seen the kick/ban already.
+                leave: {}
+            };
+            Object.keys(this.inviteRooms).forEach(function (roomId) {
+                data.invite[roomId] = _this3.inviteRooms[roomId];
+            });
+            Object.keys(this.joinRooms).forEach(function (roomId) {
+                var roomData = _this3.joinRooms[roomId];
+                var roomJson = {
+                    ephemeral: { events: [] },
+                    account_data: { events: [] },
+                    state: { events: [] },
+                    timeline: {
+                        events: [],
+                        prev_batch: null
+                    },
+                    unread_notifications: roomData._unreadNotifications
+                };
+                // Add account data
+                Object.keys(roomData._accountData).forEach(function (evType) {
+                    roomJson.account_data.events.push(roomData._accountData[evType]);
+                });
+
+                // Add receipt data
+                var receiptEvent = {
+                    type: "m.receipt",
+                    room_id: roomId,
+                    content: {
+                        // $event_id: { "m.read": { $user_id: $json } }
+                    }
+                };
+                Object.keys(roomData._readReceipts).forEach(function (userId) {
+                    var receiptData = roomData._readReceipts[userId];
+                    if (!receiptEvent.content[receiptData.eventId]) {
+                        receiptEvent.content[receiptData.eventId] = {
+                            "m.read": {}
+                        };
+                    }
+                    receiptEvent.content[receiptData.eventId]["m.read"][userId] = receiptData.data;
+                });
+                // add only if we have some receipt data
+                if (Object.keys(receiptEvent.content).length > 0) {
+                    roomJson.ephemeral.events.push(receiptEvent);
+                }
+
+                // Add timeline data
+                roomData._timeline.forEach(function (msgData) {
+                    if (!roomJson.timeline.prev_batch) {
+                        // the first event we add to the timeline MUST match up to
+                        // the prev_batch token.
+                        if (!msgData.token) {
+                            return; // this shouldn't happen as we prune constantly.
+                        }
+                        roomJson.timeline.prev_batch = msgData.token;
+                    }
+                    roomJson.timeline.events.push(msgData.event);
+                });
+
+                // Add state data: roll back current state to the start of timeline,
+                // by "reverse clobbering" from the end of the timeline to the start.
+                // Convert maps back into arrays.
+                var rollBackState = Object.create(null);
+                for (var i = roomJson.timeline.events.length - 1; i >= 0; i--) {
+                    var timelineEvent = roomJson.timeline.events[i];
+                    if (timelineEvent.state_key === null || timelineEvent.state_key === undefined) {
+                        continue; // not a state event
+                    }
+                    // since we're going back in time, we need to use the previous
+                    // state value else we'll break causality. We don't have the
+                    // complete previous state event, so we need to create one.
+                    var prevStateEvent = _utils2.default.deepCopy(timelineEvent);
+                    if (prevStateEvent.unsigned) {
+                        if (prevStateEvent.unsigned.prev_content) {
+                            prevStateEvent.content = prevStateEvent.unsigned.prev_content;
+                        }
+                        if (prevStateEvent.unsigned.prev_sender) {
+                            prevStateEvent.sender = prevStateEvent.unsigned.prev_sender;
+                        }
+                    }
+                    setState(rollBackState, prevStateEvent);
+                }
+                Object.keys(roomData._currentState).forEach(function (evType) {
+                    Object.keys(roomData._currentState[evType]).forEach(function (stateKey) {
+                        var ev = roomData._currentState[evType][stateKey];
+                        if (rollBackState[evType] && rollBackState[evType][stateKey]) {
+                            // use the reverse clobbered event instead.
+                            ev = rollBackState[evType][stateKey];
+                        }
+                        roomJson.state.events.push(ev);
+                    });
+                });
+                data.join[roomId] = roomJson;
+            });
+
+            // Add account data
+            var accData = [];
+            Object.keys(this.accountData).forEach(function (evType) {
+                accData.push(_this3.accountData[evType]);
+            });
+
+            return {
+                nextBatch: this.nextBatch,
+                roomsData: data,
+                accountData: accData
+            };
+        }
+    }]);
+
+    return SyncAccumulator;
+}();
+
+function setState(eventMap, event) {
+    if (event.state_key === null || event.state_key === undefined || !event.type) {
+        return;
+    }
+    if (!eventMap[event.type]) {
+        eventMap[event.type] = Object.create(null);
+    }
+    eventMap[event.type][event.state_key] = event;
+}
+
+module.exports = SyncAccumulator;
+
+},{"./utils":44}],42:[function(require,module,exports){
 (function (global){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2017 Vector Creations Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14615,6 +17920,12 @@ limitations under the License.
  * for HTTP and WS at some point.
  */
 
+var _reemit = require("./reemit");
+
+var _reemit2 = _interopRequireDefault(_reemit);
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
 var q = require("q");
 var User = require("./models/user");
 var Room = require("./models/room");
@@ -14629,6 +17940,11 @@ var DEBUG = true;
 // to keep open the connection. This constant is *ADDED* to the timeout= value
 // to determine the max time we're willing to wait.
 var BUFFER_PERIOD_MS = 80 * 1000;
+
+// Number of consecutive failed syncs that will lead to a syncState of ERROR as opposed
+// to RECONNECTING. This is needed to inform the client of server issues when the
+// keepAlive is successful but the server /sync fails.
+var FAILED_SYNC_ERROR_THRESHOLD = 3;
 
 function getFilterName(userId, suffix) {
     // scope this on the user ID because people may login on many accounts
@@ -14651,6 +17967,12 @@ function debuglog() {
  * @constructor
  * @param {MatrixClient} client The matrix client instance to use.
  * @param {Object} opts Config options
+ * @param {module:crypto=} opts.crypto Crypto manager
+ * @param {Function=} opts.canResetEntireTimeline A function which is called
+ * with a room ID and returns a boolean. It should return 'true' if the SDK can
+ * SAFELY remove events from this room. It may not be safe to remove events if
+ * there are other references to the timelines for this room.
+ * Default: returns false.
  */
 function SyncApi(client, opts) {
     this.client = client;
@@ -14659,17 +17981,24 @@ function SyncApi(client, opts) {
     opts.resolveInvitesToProfiles = opts.resolveInvitesToProfiles || false;
     opts.pollTimeout = opts.pollTimeout || 30 * 1000;
     opts.pendingEventOrdering = opts.pendingEventOrdering || "chronological";
+    if (!opts.canResetEntireTimeline) {
+        opts.canResetEntireTimeline = function (roomId) {
+            return false;
+        };
+    }
     this.opts = opts;
     this._peekRoomId = null;
     this._currentSyncRequest = null;
     this._syncState = null;
+    this._catchingUp = false;
     this._running = false;
     this._keepAliveTimer = null;
     this._connectionReturnedDefer = null;
     this._notifEvents = []; // accumulator of sync events in the current sync response
+    this._failedSyncCount = 0; // Number of consecutive failed /sync requests
 
     if (client.getNotifTimelineSet()) {
-        reEmit(client, client.getNotifTimelineSet(), ["Room.timeline", "Room.timelineReset"]);
+        (0, _reemit2.default)(client, client.getNotifTimelineSet(), ["Room.timeline", "Room.timelineReset"]);
     }
 }
 
@@ -14683,7 +18012,7 @@ SyncApi.prototype.createRoom = function (roomId) {
         pendingEventOrdering: this.opts.pendingEventOrdering,
         timelineSupport: client.timelineSupport
     });
-    reEmit(client, room, ["Room.name", "Room.timeline", "Room.redaction", "Room.receipt", "Room.tags", "Room.timelineReset", "Room.localEchoUpdated", "Room.accountData"]);
+    (0, _reemit2.default)(client, room, ["Room.name", "Room.timeline", "Room.redaction", "Room.receipt", "Room.tags", "Room.timelineReset", "Room.localEchoUpdated", "Room.accountData"]);
     this._registerStateListeners(room);
     return room;
 };
@@ -14697,10 +18026,10 @@ SyncApi.prototype._registerStateListeners = function (room) {
     // we need to also re-emit room state and room member events, so hook it up
     // to the client now. We need to add a listener for RoomState.members in
     // order to hook them correctly. (TODO: find a better way?)
-    reEmit(client, room.currentState, ["RoomState.events", "RoomState.members", "RoomState.newMember"]);
+    (0, _reemit2.default)(client, room.currentState, ["RoomState.events", "RoomState.members", "RoomState.newMember"]);
     room.currentState.on("RoomState.newMember", function (event, state, member) {
         member.user = client.getUser(member.userId);
-        reEmit(client, member, ["RoomMember.name", "RoomMember.typing", "RoomMember.powerLevel", "RoomMember.membership"]);
+        (0, _reemit2.default)(client, member, ["RoomMember.name", "RoomMember.typing", "RoomMember.powerLevel", "RoomMember.membership"]);
     });
 };
 
@@ -14919,8 +18248,6 @@ SyncApi.prototype.getSyncState = function () {
  * Main entry point
  */
 SyncApi.prototype.sync = function () {
-    debuglog("SyncApi.sync: starting with sync token " + this.client.store.getSyncToken());
-
     var client = this.client;
     var self = this;
 
@@ -15022,6 +18349,8 @@ SyncApi.prototype.retryImmediately = function () {
  * @param {boolean} syncOptions.hasSyncedBefore
  */
 SyncApi.prototype._sync = function (syncOptions) {
+    var _this = this;
+
     var client = this.client;
     var self = this;
 
@@ -15042,9 +18371,30 @@ SyncApi.prototype._sync = function (syncOptions) {
 
     var syncToken = client.store.getSyncToken();
 
+    var pollTimeout = this.opts.pollTimeout;
+
+    if (this.getSyncState() !== 'SYNCING' || this._catchingUp) {
+        // unless we are happily syncing already, we want the server to return
+        // as quickly as possible, even if there are no events queued. This
+        // serves two purposes:
+        //
+        // * When the connection dies, we want to know asap when it comes back,
+        //   so that we can hide the error from the user. (We don't want to
+        //   have to wait for an event or a timeout).
+        //
+        // * We want to know if the server has any to_device messages queued up
+        //   for us. We do that by calling it with a zero timeout until it
+        //   doesn't give us any more to_device messages.
+        this._catchingUp = true;
+        pollTimeout = 0;
+    }
+
+    // normal timeout= plus buffer time
+    var clientSideTimeoutMs = pollTimeout + BUFFER_PERIOD_MS;
+
     var qps = {
         filter: filterId,
-        timeout: this.opts.pollTimeout
+        timeout: pollTimeout
     };
 
     if (syncToken) {
@@ -15064,17 +18414,57 @@ SyncApi.prototype._sync = function (syncOptions) {
         qps.timeout = 0;
     }
 
-    // normal timeout= plus buffer time
-    var clientSideTimeoutMs = this.opts.pollTimeout + BUFFER_PERIOD_MS;
+    var isCachedResponse = false;
 
-    this._currentSyncRequest = client._http.authedRequest(undefined, "GET", "/sync", qps, undefined, clientSideTimeoutMs);
+    var syncPromise = void 0;
+    if (!syncOptions.hasSyncedBefore) {
+        // Don't do an HTTP hit to /sync. Instead, load up the persisted /sync data,
+        // if there is data there.
+        syncPromise = client.store.getSavedSync();
+    } else {
+        syncPromise = q(null);
+    }
 
-    this._currentSyncRequest.done(function (data) {
+    syncPromise.then(function (savedSync) {
+        if (savedSync) {
+            debuglog("sync(): not doing HTTP hit, instead returning stored /sync data");
+            isCachedResponse = true;
+            return {
+                next_batch: savedSync.nextBatch,
+                rooms: savedSync.roomsData,
+                account_data: {
+                    events: savedSync.accountData
+                }
+            };
+        } else {
+            //debuglog('Starting sync since=' + syncToken);
+            _this._currentSyncRequest = client._http.authedRequest(undefined, "GET", "/sync", qps, undefined, clientSideTimeoutMs);
+            return _this._currentSyncRequest;
+        }
+    }).then(function (data) {
+        //debuglog('Completed sync, next_batch=' + data.next_batch);
+
         // set the sync token NOW *before* processing the events. We do this so
         // if something barfs on an event we can skip it rather than constantly
         // polling with the same token.
         client.store.setSyncToken(data.next_batch);
 
+        // Reset after a successful sync
+        self._failedSyncCount = 0;
+
+        // We need to wait until the sync data has been sent to the backend
+        // because it appears that the sync data gets modified somewhere in
+        // processing it in such a way as to make it no longer cloneable.
+        // XXX: Find out what is modifying it!
+        if (!isCachedResponse) {
+            // Don't give the store back its own cached data
+            return client.store.setSyncData(data).then(function () {
+                return data;
+            });
+        } else {
+            return q(data);
+        }
+    }).done(function (data) {
         try {
             self._processSyncResponse(syncToken, data);
         } catch (e) {
@@ -15084,14 +18474,28 @@ SyncApi.prototype._sync = function (syncOptions) {
         }
 
         // emit synced events
+        var syncEventData = {
+            oldSyncToken: syncToken,
+            nextSyncToken: data.next_batch,
+            catchingUp: self._catchingUp
+        };
+
         if (!syncOptions.hasSyncedBefore) {
-            self._updateSyncState("PREPARED");
+            self._updateSyncState("PREPARED", syncEventData);
             syncOptions.hasSyncedBefore = true;
         }
 
         // keep emitting SYNCING -> SYNCING for clients who want to do bulk updates
-        self._updateSyncState("SYNCING");
+        if (!isCachedResponse) {
+            self._updateSyncState("SYNCING", syncEventData);
 
+            // tell databases that everything is now in a consistent state and can be
+            // saved (no point doing so if we only have the data we just got out of the
+            // store).
+            client.store.save();
+        }
+
+        // Begin next sync
         self._sync(syncOptions);
     }, function (err) {
         if (!self._running) {
@@ -15106,6 +18510,9 @@ SyncApi.prototype._sync = function (syncOptions) {
         console.error("/sync error %s", err);
         console.error(err);
 
+        self._failedSyncCount++;
+        console.log('Number of consecutive failed sync requests:', self._failedSyncCount);
+
         debuglog("Starting keep-alive");
         // Note that we do *not* mark the sync connection as
         // lost yet: we only do this if a keepalive poke
@@ -15118,7 +18525,8 @@ SyncApi.prototype._sync = function (syncOptions) {
             self._sync(syncOptions);
         });
         self._currentSyncRequest = null;
-        self._updateSyncState("RECONNECTING");
+        // Transition from RECONNECTING to ERROR after a given number of failed syncs
+        self._updateSyncState(self._failedSyncCount >= FAILED_SYNC_ERROR_THRESHOLD ? "ERROR" : "RECONNECTING");
     });
 };
 
@@ -15131,6 +18539,8 @@ SyncApi.prototype._sync = function (syncOptions) {
  * @param {Object} data The response from /sync
  */
 SyncApi.prototype._processSyncResponse = function (syncToken, data) {
+    var _this2 = this;
+
     var client = this.client;
     var self = this;
 
@@ -15139,6 +18549,7 @@ SyncApi.prototype._processSyncResponse = function (syncToken, data) {
     //    next_batch: $token,
     //    presence: { events: [] },
     //    account_data: { events: [] },
+    //    device_lists: { changed: ["@user:server", ... ]},
     //    to_device: { events: [] },
     //    rooms: {
     //      invite: {
@@ -15201,16 +18612,20 @@ SyncApi.prototype._processSyncResponse = function (syncToken, data) {
     }
 
     // handle to-device events
-    if (data.to_device && utils.isArray(data.to_device.events)) {
+    if (data.to_device && utils.isArray(data.to_device.events) && data.to_device.events.length > 0) {
         data.to_device.events.map(client.getEventMapper()).forEach(function (toDeviceEvent) {
             var content = toDeviceEvent.getContent();
             if (toDeviceEvent.getType() == "m.room.message" && content.msgtype == "m.bad.encrypted") {
-                console.warn("Unable to decrypt to-device event: " + content.body);
+                // the mapper already logged a warning.
+                console.log('Ignoring undecryptable to-device event from ' + toDeviceEvent.getSender());
                 return;
             }
 
             client.emit("toDeviceEvent", toDeviceEvent);
         });
+    } else {
+        // no more to-device events: we can stop polling with a short timeout.
+        this._catchingUp = false;
     }
 
     // the returned json structure is a bit crap, so make it into a
@@ -15312,7 +18727,7 @@ SyncApi.prototype._processSyncResponse = function (syncToken, data) {
                 // timeline.
                 room.currentState.paginationToken = syncToken;
                 self._deregisterStateListeners(room);
-                room.resetLiveTimeline(joinObj.timeline.prev_batch);
+                room.resetLiveTimeline(joinObj.timeline.prev_batch, self.opts.canResetEntireTimeline(room.roomId));
 
                 // We have to assume any gap in any timeline is
                 // reason to stop incrementally tracking notifications and
@@ -15392,6 +18807,13 @@ SyncApi.prototype._processSyncResponse = function (syncToken, data) {
             client.getNotifTimelineSet().addLiveEvent(event);
         });
     }
+
+    // Handle device list updates
+    if (this.opts.crypto && data.device_lists && data.device_lists.changed) {
+        data.device_lists.changed.forEach(function (u) {
+            _this2.opts.crypto.userDeviceListChanged(u);
+        });
+    }
 };
 
 /**
@@ -15399,7 +18821,7 @@ SyncApi.prototype._processSyncResponse = function (syncToken, data) {
  * @param {number} delay How long to delay until the first poll.
  *        defaults to a short, randomised interval (to prevent
  *        tightlooping if /versions succeeds but /sync etc. fail).
- * @return {promise}
+ * @return {promise} which resolves once the connection returns
  */
 SyncApi.prototype._startKeepAlives = function (delay) {
     if (delay === undefined) {
@@ -15422,7 +18844,11 @@ SyncApi.prototype._startKeepAlives = function (delay) {
 };
 
 /**
+ * Make a dummy call to /_matrix/client/versions, to see if the HS is
+ * reachable.
  *
+ * On failure, schedules a call back to itself. On success, resolves
+ * this._connectionReturnedDefer.
  */
 SyncApi.prototype._pokeKeepAlive = function () {
     var self = this;
@@ -15642,26 +19068,8 @@ SyncApi.prototype._onOnline = function () {
 
 function createNewUser(client, userId) {
     var user = new User(userId);
-    reEmit(client, user, ["User.avatarUrl", "User.displayName", "User.presence", "User.currentlyActive", "User.lastPresenceTs"]);
+    (0, _reemit2.default)(client, user, ["User.avatarUrl", "User.displayName", "User.presence", "User.currentlyActive", "User.lastPresenceTs"]);
     return user;
-}
-
-function reEmit(reEmitEntity, emittableEntity, eventNames) {
-    utils.forEach(eventNames, function (eventName) {
-        // setup a listener on the entity (the Room, User, etc) for this event
-        emittableEntity.on(eventName, function () {
-            // take the args from the listener and reuse them, adding the
-            // event name to the arg list so it works with .emit()
-            // Transformation Example:
-            // listener on "foo" => function(a,b) { ... }
-            // Re-emit on "thing" => thing.emit("foo", a, b)
-            var newArgs = [eventName];
-            for (var i = 0; i < arguments.length; i++) {
-                newArgs.push(arguments[i]);
-            }
-            reEmitEntity.emit.apply(reEmitEntity, newArgs);
-        });
-    });
 }
 
 /** */
@@ -15669,7 +19077,7 @@ module.exports = SyncApi;
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"./filter":14,"./models/event-timeline":20,"./models/room":25,"./models/user":27,"./utils":36,"q":42}],35:[function(require,module,exports){
+},{"./filter":17,"./models/event-timeline":23,"./models/room":28,"./models/user":30,"./reemit":33,"./utils":44,"q":51}],43:[function(require,module,exports){
 /*
 Copyright 2016 OpenMarket Ltd
 
@@ -16145,7 +19553,7 @@ module.exports.TimelineWindow = TimelineWindow;
  */
 module.exports.TimelineIndex = TimelineIndex;
 
-},{"./models/event-timeline":20,"q":42}],36:[function(require,module,exports){
+},{"./models/event-timeline":23,"q":51}],44:[function(require,module,exports){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
 
@@ -16803,7 +20211,7 @@ module.exports.inherits = function (ctor, superCtor) {
     });
 };
 
-},{}],37:[function(require,module,exports){
+},{}],45:[function(require,module,exports){
 (function (global){
 /*
 Copyright 2015, 2016 OpenMarket Ltd
@@ -16833,6 +20241,47 @@ var DEBUG = true; // set true to enable console logging.
 // events: hangup, error(err), replaced(call), state(state, oldState)
 
 /**
+ * Fires when the MatrixCall encounters an error when sending a Matrix event.
+ * <p>
+ * This is required to allow errors, which occur during sending of events, to bubble up.
+ * (This is because call.js does a hangup when it encounters a normal `error`, which in
+ * turn could lead to an UnknownDeviceError.)
+ * <p>
+ * To deal with an UnknownDeviceError when trying to send events, the application should let
+ * users know that there are new devices in the encrypted room (into which the event was
+ * sent) and give the user the options to resend unsent events or cancel them. Resending
+ * is done using {@link module:client~MatrixClient#resendEvent} and cancelling can be done by using
+ * {@link module:client~MatrixClient#cancelPendingEvent}.
+ * <p>
+ * MatrixCall will not do anything in response to an error that causes `send_event_error`
+ * to be emitted with the exception of sending `m.call.candidates`, which is retried upon
+ * failure when ICE candidates are being sent. This happens during call setup.
+ *
+ * @event module:webrtc/call~MatrixCall#"send_event_error"
+ * @param {Error} err The error caught from calling client.sendEvent in call.js.
+ * @example
+ * matrixCall.on("send_event_error", function(err){
+ *   console.error(err);
+ * });
+ */
+
+/**
+ * Fires whenever an error occurs when call.js encounters an issue with setting up the call.
+ * <p>
+ * The error given will have a code equal to either `MatrixCall.ERR_LOCAL_OFFER_FAILED` or
+ * `MatrixCall.ERR_NO_USER_MEDIA`. `ERR_LOCAL_OFFER_FAILED` is emitted when the local client
+ * fails to create an offer. `ERR_NO_USER_MEDIA` is emitted when the user has denied access
+ * to their audio/video hardware.
+ *
+ * @event module:webrtc/call~MatrixCall#"error"
+ * @param {Error} err The error raised by MatrixCall.
+ * @example
+ * matrixCall.on("error", function(err){
+ *   console.error(err.code, err);
+ * });
+ */
+
+/**
  * Construct a new Matrix Call.
  * @constructor
  * @param {Object} opts Config options.
@@ -16858,7 +20307,7 @@ function MatrixCall(opts) {
         utils.checkObjectHasKeys(server, ["urls"]);
     });
 
-    this.callId = "c" + new Date().getTime();
+    this.callId = "c" + new Date().getTime() + Math.random();
     this.state = 'fledgling';
     this.didConnect = false;
 
@@ -16922,7 +20371,7 @@ MatrixCall.prototype.placeVideoCall = function (remoteVideoElement, localVideoEl
 /**
  * Place a screen-sharing call to this room. This includes audio.
  * <b>This method is EXPERIMENTAL and subject to change without warning. It
- * only works in Google Chrome.</b>
+ * only works in Google Chrome and Firefox >= 44.</b>
  * @param {Element} remoteVideoElement a <code>&lt;video&gt;</code> DOM element
  * to render video to.
  * @param {Element} localVideoElement a <code>&lt;video&gt;</code> DOM element
@@ -16932,7 +20381,7 @@ MatrixCall.prototype.placeVideoCall = function (remoteVideoElement, localVideoEl
 MatrixCall.prototype.placeScreenSharingCall = function (remoteVideoElement, localVideoElement) {
     debuglog("placeScreenSharingCall");
     checkForErrorListener(this);
-    var screenConstraints = _getChromeScreenSharingConstraints(this);
+    var screenConstraints = _getScreenSharingConstraints(this);
     if (!screenConstraints) {
         return;
     }
@@ -17007,21 +20456,21 @@ MatrixCall.prototype.pauseElement = function (element, queueId) {
  * serialising the operation into a chain of promises to avoid racing access
  * to the element
  * @param {Element} element HTMLMediaElement element to pause
- * @param {string} src the src attribute value to assign to the element
+ * @param {MediaStream} srcObject the srcObject attribute value to assign to the element
  * @param {string} queueId Arbitrary ID to track the chain of promises to be used
  */
-MatrixCall.prototype.assignElement = function (element, src, queueId) {
-    console.log("queuing assign on " + queueId + " element " + element + " for " + src);
+MatrixCall.prototype.assignElement = function (element, srcObject, queueId) {
+    console.log("queuing assign on " + queueId + " element " + element + " for " + srcObject);
     if (this.mediaPromises[queueId]) {
         this.mediaPromises[queueId] = this.mediaPromises[queueId].then(function () {
             console.log("previous promise completed for " + queueId);
-            element.src = src;
+            element.srcObject = srcObject;
         }, function () {
             console.log("previous promise failed for " + queueId);
-            element.src = src;
+            element.srcObject = srcObject;
         });
     } else {
-        element.src = src;
+        element.srcObject = srcObject;
     }
 };
 
@@ -17057,23 +20506,19 @@ MatrixCall.prototype.getRemoteAudioElement = function () {
  * @param {Element} element The <code>&lt;video&gt;</code> DOM element.
  */
 MatrixCall.prototype.setLocalVideoElement = function (element) {
-    var _this = this;
-
     this.localVideoElement = element;
 
     if (element && this.localAVStream && this.type === 'video') {
-        (function () {
-            element.autoplay = true;
-            _this.assignElement(element, _this.URL.createObjectURL(_this.localAVStream), "localVideo");
-            element.muted = true;
-            var self = _this;
-            setTimeout(function () {
-                var vel = self.getLocalVideoElement();
-                if (vel.play) {
-                    self.playElement(vel, "localVideo");
-                }
-            }, 0);
-        })();
+        element.autoplay = true;
+        this.assignElement(element, this.localAVStream, "localVideo");
+        element.muted = true;
+        var self = this;
+        setTimeout(function () {
+            var vel = self.getLocalVideoElement();
+            if (vel.play) {
+                self.playElement(vel, "localVideo");
+            }
+        }, 0);
     }
 };
 
@@ -17096,6 +20541,7 @@ MatrixCall.prototype.setRemoteVideoElement = function (element) {
 MatrixCall.prototype.setRemoteAudioElement = function (element) {
     this.remoteVideoElement.muted = true;
     this.remoteAudioElement = element;
+    this.remoteAudioElement.muted = false;
     _tryPlayRemoteAudioStream(this);
 };
 
@@ -17160,10 +20606,10 @@ MatrixCall.prototype.answer = function () {
     var self = this;
 
     if (!this.localAVStream && !this.waitForLocalAVStream) {
-        this.webRtc.getUserMedia(_getUserMediaVideoContraints(this.type), hookCallback(self, self._gotUserMediaForAnswer), hookCallback(self, self._getUserMediaFailed));
+        this.webRtc.getUserMedia(_getUserMediaVideoContraints(this.type), hookCallback(self, self._maybeGotUserMediaForAnswer), hookCallback(self, self._maybeGotUserMediaForAnswer));
         setState(this, 'wait_local_media');
     } else if (this.localAVStream) {
-        this._gotUserMediaForAnswer(this.localAVStream);
+        this._maybeGotUserMediaForAnswer(this.localAVStream);
     } else if (this.waitForLocalAVStream) {
         setState(this, 'wait_local_media');
     }
@@ -17182,11 +20628,11 @@ MatrixCall.prototype._replacedBy = function (newCall) {
         newCall.waitForLocalAVStream = true;
     } else if (this.state == 'create_offer') {
         debuglog("Handing local stream to new call");
-        newCall._gotUserMediaForAnswer(this.localAVStream);
+        newCall._maybeGotUserMediaForAnswer(this.localAVStream);
         delete this.localAVStream;
     } else if (this.state == 'invite_sent') {
         debuglog("Handing local stream to new call");
-        newCall._gotUserMediaForAnswer(this.localAVStream);
+        newCall._maybeGotUserMediaForAnswer(this.localAVStream);
         delete this.localAVStream;
     }
     newCall.localVideoElement = this.localVideoElement;
@@ -17272,46 +20718,64 @@ MatrixCall.prototype.isMicrophoneMuted = function () {
  * @private
  * @param {Object} stream
  */
-MatrixCall.prototype._gotUserMediaForInvite = function (stream) {
+MatrixCall.prototype._maybeGotUserMediaForInvite = function (stream) {
     if (this.successor) {
-        this.successor._gotUserMediaForAnswer(stream);
+        this.successor._maybeGotUserMediaForAnswer(stream);
         return;
     }
     if (this.state == 'ended') {
         return;
     }
-    debuglog("_gotUserMediaForInvite -> " + this.type);
+    debuglog("_maybeGotUserMediaForInvite -> " + this.type);
     var self = this;
-    var videoEl = this.getLocalVideoElement();
 
-    if (videoEl && this.type == 'video') {
-        videoEl.autoplay = true;
-        if (this.screenSharingStream) {
-            debuglog("Setting screen sharing stream to the local video element");
-            this.assignElement(videoEl, this.URL.createObjectURL(this.screenSharingStream), "localVideo");
-        } else {
-            this.assignElement(videoEl, this.URL.createObjectURL(stream), "localVideo");
+    var error = stream;
+    var constraints = {
+        'mandatory': {
+            'OfferToReceiveAudio': true,
+            'OfferToReceiveVideo': self.type === 'video'
         }
-        videoEl.muted = true;
-        setTimeout(function () {
-            var vel = self.getLocalVideoElement();
-            if (vel.play) {
-                self.playElement(vel, "localVideo");
+    };
+    if (stream instanceof MediaStream) {
+        var videoEl = this.getLocalVideoElement();
+
+        if (videoEl && this.type == 'video') {
+            videoEl.autoplay = true;
+            if (this.screenSharingStream) {
+                debuglog("Setting screen sharing stream to the local video" + " element");
+                this.assignElement(videoEl, this.screenSharingStream, "localVideo");
+            } else {
+                this.assignElement(videoEl, stream, "localVideo");
             }
-        }, 0);
+            videoEl.muted = true;
+            setTimeout(function () {
+                var vel = self.getLocalVideoElement();
+                if (vel.play) {
+                    self.playElement(vel, "localVideo");
+                }
+            }, 0);
+        }
+
+        if (this.screenSharingStream) {
+            this.screenSharingStream.addTrack(stream.getAudioTracks()[0]);
+            stream = this.screenSharingStream;
+        }
+
+        this.localAVStream = stream;
+        // why do we enable audio (and only audio) tracks here? -- matthew
+        setTracksEnabled(stream.getAudioTracks(), true);
+        this.peerConn = _createPeerConnection(this);
+        this.peerConn.addStream(stream);
+    } else if (error.name === 'PermissionDeniedError') {
+        debuglog('User denied access to camera/microphone.' + ' Or possibly you are using an insecure domain. Receiving only.');
+        this.peerConn = _createPeerConnection(this);
+    } else {
+        debuglog('Failed to getUserMedia.');
+        this._getUserMediaFailed(error);
+        return;
     }
 
-    if (this.screenSharingStream) {
-        this.screenSharingStream.addTrack(stream.getAudioTracks()[0]);
-        stream = this.screenSharingStream;
-    }
-
-    this.localAVStream = stream;
-    // why do we enable audio (and only audio) tracks here? -- matthew
-    setTracksEnabled(stream.getAudioTracks(), true);
-    this.peerConn = _createPeerConnection(this);
-    this.peerConn.addStream(stream);
-    this.peerConn.createOffer(hookCallback(self, self._gotLocalOffer), hookCallback(self, self._getLocalOfferFailed));
+    this.peerConn.createOffer(hookCallback(self, self._gotLocalOffer), hookCallback(self, self._getLocalOfferFailed), constraints);
     setState(self, 'create_offer');
 };
 
@@ -17320,33 +20784,43 @@ MatrixCall.prototype._gotUserMediaForInvite = function (stream) {
  * @private
  * @param {Object} stream
  */
-MatrixCall.prototype._gotUserMediaForAnswer = function (stream) {
+MatrixCall.prototype._maybeGotUserMediaForAnswer = function (stream) {
     var self = this;
     if (self.state == 'ended') {
         return;
     }
-    var localVidEl = self.getLocalVideoElement();
 
-    if (localVidEl && self.type == 'video') {
-        localVidEl.autoplay = true;
-        this.assignElement(localVidEl, this.URL.createObjectURL(stream), "localVideo");
-        localVidEl.muted = true;
-        setTimeout(function () {
-            var vel = self.getLocalVideoElement();
-            if (vel.play) {
-                self.playElement(vel, "localVideo");
-            }
-        }, 0);
+    var error = stream;
+    if (stream instanceof MediaStream) {
+        var localVidEl = self.getLocalVideoElement();
+
+        if (localVidEl && self.type == 'video') {
+            localVidEl.autoplay = true;
+            this.assignElement(localVidEl, stream, "localVideo");
+            localVidEl.muted = true;
+            setTimeout(function () {
+                var vel = self.getLocalVideoElement();
+                if (vel.play) {
+                    self.playElement(vel, "localVideo");
+                }
+            }, 0);
+        }
+
+        self.localAVStream = stream;
+        setTracksEnabled(stream.getAudioTracks(), true);
+        self.peerConn.addStream(stream);
+    } else if (error.name === 'PermissionDeniedError') {
+        debuglog('User denied access to camera/microphone.' + ' Or possibly you are using an insecure domain. Receiving only.');
+    } else {
+        debuglog('Failed to getUserMedia.');
+        this._getUserMediaFailed(error);
+        return;
     }
-
-    self.localAVStream = stream;
-    setTracksEnabled(stream.getAudioTracks(), true);
-    self.peerConn.addStream(stream);
 
     var constraints = {
         'mandatory': {
             'OfferToReceiveAudio': true,
-            'OfferToReceiveVideo': self.type == 'video'
+            'OfferToReceiveVideo': self.type === 'video'
         }
     };
     self.peerConn.createAnswer(function (description) {
@@ -17655,7 +21129,9 @@ var setState = function setState(self, state) {
  * @return {Promise}
  */
 var sendEvent = function sendEvent(self, eventType, content) {
-    return self.client.sendEvent(self.roomId, eventType, content);
+    return self.client.sendEvent(self.roomId, eventType, content).catch(function (err) {
+        self.emit('send_event_error', err);
+    });
 };
 
 var sendCandidate = function sendCandidate(self, content) {
@@ -17674,19 +21150,19 @@ var terminate = function terminate(self, hangupParty, hangupReason, shouldEmit) 
         if (self.getRemoteVideoElement().pause) {
             self.pauseElement(self.getRemoteVideoElement(), "remoteVideo");
         }
-        self.assignElement(self.getRemoteVideoElement(), "", "remoteVideo");
+        self.assignElement(self.getRemoteVideoElement(), null, "remoteVideo");
     }
     if (self.getRemoteAudioElement()) {
         if (self.getRemoteAudioElement().pause) {
             self.pauseElement(self.getRemoteAudioElement(), "remoteAudio");
         }
-        self.assignElement(self.getRemoteAudioElement(), "", "remoteAudio");
+        self.assignElement(self.getRemoteAudioElement(), null, "remoteAudio");
     }
     if (self.getLocalVideoElement()) {
         if (self.getLocalVideoElement().pause) {
             self.pauseElement(self.getLocalVideoElement(), "localVideo");
         }
-        self.assignElement(self.getLocalVideoElement(), "", "localVideo");
+        self.assignElement(self.getLocalVideoElement(), null, "localVideo");
     }
     self.hangupParty = hangupParty;
     self.hangupReason = hangupReason;
@@ -17744,7 +21220,7 @@ var _tryPlayRemoteStream = function _tryPlayRemoteStream(self) {
     if (self.getRemoteVideoElement() && self.remoteAVStream) {
         var player = self.getRemoteVideoElement();
         player.autoplay = true;
-        self.assignElement(player, self.URL.createObjectURL(self.remoteAVStream), "remoteVideo");
+        self.assignElement(player, self.remoteAVStream, "remoteVideo");
         setTimeout(function () {
             var vel = self.getRemoteVideoElement();
             if (vel.play) {
@@ -17762,7 +21238,7 @@ var _tryPlayRemoteAudioStream = function _tryPlayRemoteAudioStream(self) {
     if (self.getRemoteAudioElement() && self.remoteAStream) {
         var player = self.getRemoteAudioElement();
         player.autoplay = true;
-        self.assignElement(player, self.URL.createObjectURL(self.remoteAStream), "remoteAudio");
+        self.assignElement(player, self.remoteAStream, "remoteAudio");
         setTimeout(function () {
             var ael = self.getRemoteAudioElement();
             if (ael.play) {
@@ -17835,7 +21311,7 @@ var _sendCandidateQueue = function _sendCandidateQueue(self) {
 
 var _placeCallWithConstraints = function _placeCallWithConstraints(self, constraints) {
     self.client.callList[self.callId] = self;
-    self.webRtc.getUserMedia(constraints, hookCallback(self, self._gotUserMediaForInvite), hookCallback(self, self._getUserMediaFailed));
+    self.webRtc.getUserMedia(constraints, hookCallback(self, self._maybeGotUserMediaForInvite), hookCallback(self, self._maybeGotUserMediaForInvite));
     setState(self, 'wait_local_media');
     self.direction = 'outbound';
     self.config = constraints;
@@ -17867,7 +21343,7 @@ var _createPeerConnection = function _createPeerConnection(self) {
     return pc;
 };
 
-var _getChromeScreenSharingConstraints = function _getChromeScreenSharingConstraints(call) {
+var _getScreenSharingConstraints = function _getScreenSharingConstraints(call) {
     var screen = global.screen;
     if (!screen) {
         call.emit("error", callError(MatrixCall.ERR_NO_USER_MEDIA, "Couldn't determine screen sharing constaints."));
@@ -17876,6 +21352,7 @@ var _getChromeScreenSharingConstraints = function _getChromeScreenSharingConstra
 
     return {
         video: {
+            mediaSource: 'screen',
             mandatory: {
                 chromeMediaSource: "screen",
                 chromeMediaSourceId: "" + Date.now(),
@@ -17891,16 +21368,25 @@ var _getChromeScreenSharingConstraints = function _getChromeScreenSharingConstra
 var _getUserMediaVideoContraints = function _getUserMediaVideoContraints(callType) {
     switch (callType) {
         case 'voice':
-            return { audio: true, video: false };
+            return {
+                audio: {
+                    deviceId: audioInput ? { exact: audioInput } : undefined
+                }, video: false
+            };
         case 'video':
-            return { audio: true, video: {
+            return {
+                audio: {
+                    deviceId: audioInput ? { exact: audioInput } : undefined
+                }, video: {
+                    deviceId: videoInput ? { exact: videoInput } : undefined,
                     mandatory: {
                         minWidth: 640,
                         maxWidth: 640,
                         minHeight: 360,
                         maxHeight: 360
                     }
-                } };
+                }
+            };
     }
 };
 
@@ -17931,6 +21417,27 @@ var forAllTracksOnStream = function forAllTracksOnStream(s, f) {
 
 /** The MatrixCall class. */
 module.exports.MatrixCall = MatrixCall;
+
+var audioInput = void 0;
+var videoInput = void 0;
+/**
+ * Set an audio input device to use for MatrixCalls
+ * @function
+ * @param {string=} deviceId the identifier for the device
+ * undefined treated as unset
+ */
+module.exports.setAudioInput = function (deviceId) {
+    audioInput = deviceId;
+};
+/**
+ * Set a video input device to use for MatrixCalls
+ * @function
+ * @param {string=} deviceId the identifier for the device
+ * undefined treated as unset
+ */
+module.exports.setVideoInput = function (deviceId) {
+    videoInput = deviceId;
+};
 
 /**
  * Create a new Matrix call for the browser.
@@ -17989,7 +21496,7 @@ module.exports.createNewMatrixCall = function (client, roomId) {
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"../utils":36,"events":46}],38:[function(require,module,exports){
+},{"../utils":44,"events":48}],46:[function(require,module,exports){
 /* Copyright 2015 Mark Haines
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18084,7 +21591,7 @@ function stringifyObject(object) {
 /** */
 module.exports = {stringify: stringify};
 
-},{}],39:[function(require,module,exports){
+},{}],47:[function(require,module,exports){
 // Browser Request
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18580,7 +22087,311 @@ function b64_enc (data) {
 }));
 //UMD FOOTER END
 
-},{}],40:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+function EventEmitter() {
+  this._events = this._events || {};
+  this._maxListeners = this._maxListeners || undefined;
+}
+module.exports = EventEmitter;
+
+// Backwards-compat with node 0.10.x
+EventEmitter.EventEmitter = EventEmitter;
+
+EventEmitter.prototype._events = undefined;
+EventEmitter.prototype._maxListeners = undefined;
+
+// By default EventEmitters will print a warning if more than 10 listeners are
+// added to it. This is a useful default which helps finding memory leaks.
+EventEmitter.defaultMaxListeners = 10;
+
+// Obviously not all Emitters should be limited to 10. This function allows
+// that to be increased. Set to zero for unlimited.
+EventEmitter.prototype.setMaxListeners = function(n) {
+  if (!isNumber(n) || n < 0 || isNaN(n))
+    throw TypeError('n must be a positive number');
+  this._maxListeners = n;
+  return this;
+};
+
+EventEmitter.prototype.emit = function(type) {
+  var er, handler, len, args, i, listeners;
+
+  if (!this._events)
+    this._events = {};
+
+  // If there is no 'error' event listener then throw.
+  if (type === 'error') {
+    if (!this._events.error ||
+        (isObject(this._events.error) && !this._events.error.length)) {
+      er = arguments[1];
+      if (er instanceof Error) {
+        throw er; // Unhandled 'error' event
+      } else {
+        // At least give some kind of context to the user
+        var err = new Error('Uncaught, unspecified "error" event. (' + er + ')');
+        err.context = er;
+        throw err;
+      }
+    }
+  }
+
+  handler = this._events[type];
+
+  if (isUndefined(handler))
+    return false;
+
+  if (isFunction(handler)) {
+    switch (arguments.length) {
+      // fast cases
+      case 1:
+        handler.call(this);
+        break;
+      case 2:
+        handler.call(this, arguments[1]);
+        break;
+      case 3:
+        handler.call(this, arguments[1], arguments[2]);
+        break;
+      // slower
+      default:
+        args = Array.prototype.slice.call(arguments, 1);
+        handler.apply(this, args);
+    }
+  } else if (isObject(handler)) {
+    args = Array.prototype.slice.call(arguments, 1);
+    listeners = handler.slice();
+    len = listeners.length;
+    for (i = 0; i < len; i++)
+      listeners[i].apply(this, args);
+  }
+
+  return true;
+};
+
+EventEmitter.prototype.addListener = function(type, listener) {
+  var m;
+
+  if (!isFunction(listener))
+    throw TypeError('listener must be a function');
+
+  if (!this._events)
+    this._events = {};
+
+  // To avoid recursion in the case that type === "newListener"! Before
+  // adding it to the listeners, first emit "newListener".
+  if (this._events.newListener)
+    this.emit('newListener', type,
+              isFunction(listener.listener) ?
+              listener.listener : listener);
+
+  if (!this._events[type])
+    // Optimize the case of one listener. Don't need the extra array object.
+    this._events[type] = listener;
+  else if (isObject(this._events[type]))
+    // If we've already got an array, just append.
+    this._events[type].push(listener);
+  else
+    // Adding the second element, need to change to array.
+    this._events[type] = [this._events[type], listener];
+
+  // Check for listener leak
+  if (isObject(this._events[type]) && !this._events[type].warned) {
+    if (!isUndefined(this._maxListeners)) {
+      m = this._maxListeners;
+    } else {
+      m = EventEmitter.defaultMaxListeners;
+    }
+
+    if (m && m > 0 && this._events[type].length > m) {
+      this._events[type].warned = true;
+      console.error('(node) warning: possible EventEmitter memory ' +
+                    'leak detected. %d listeners added. ' +
+                    'Use emitter.setMaxListeners() to increase limit.',
+                    this._events[type].length);
+      if (typeof console.trace === 'function') {
+        // not supported in IE 10
+        console.trace();
+      }
+    }
+  }
+
+  return this;
+};
+
+EventEmitter.prototype.on = EventEmitter.prototype.addListener;
+
+EventEmitter.prototype.once = function(type, listener) {
+  if (!isFunction(listener))
+    throw TypeError('listener must be a function');
+
+  var fired = false;
+
+  function g() {
+    this.removeListener(type, g);
+
+    if (!fired) {
+      fired = true;
+      listener.apply(this, arguments);
+    }
+  }
+
+  g.listener = listener;
+  this.on(type, g);
+
+  return this;
+};
+
+// emits a 'removeListener' event iff the listener was removed
+EventEmitter.prototype.removeListener = function(type, listener) {
+  var list, position, length, i;
+
+  if (!isFunction(listener))
+    throw TypeError('listener must be a function');
+
+  if (!this._events || !this._events[type])
+    return this;
+
+  list = this._events[type];
+  length = list.length;
+  position = -1;
+
+  if (list === listener ||
+      (isFunction(list.listener) && list.listener === listener)) {
+    delete this._events[type];
+    if (this._events.removeListener)
+      this.emit('removeListener', type, listener);
+
+  } else if (isObject(list)) {
+    for (i = length; i-- > 0;) {
+      if (list[i] === listener ||
+          (list[i].listener && list[i].listener === listener)) {
+        position = i;
+        break;
+      }
+    }
+
+    if (position < 0)
+      return this;
+
+    if (list.length === 1) {
+      list.length = 0;
+      delete this._events[type];
+    } else {
+      list.splice(position, 1);
+    }
+
+    if (this._events.removeListener)
+      this.emit('removeListener', type, listener);
+  }
+
+  return this;
+};
+
+EventEmitter.prototype.removeAllListeners = function(type) {
+  var key, listeners;
+
+  if (!this._events)
+    return this;
+
+  // not listening for removeListener, no need to emit
+  if (!this._events.removeListener) {
+    if (arguments.length === 0)
+      this._events = {};
+    else if (this._events[type])
+      delete this._events[type];
+    return this;
+  }
+
+  // emit removeListener for all listeners on all events
+  if (arguments.length === 0) {
+    for (key in this._events) {
+      if (key === 'removeListener') continue;
+      this.removeAllListeners(key);
+    }
+    this.removeAllListeners('removeListener');
+    this._events = {};
+    return this;
+  }
+
+  listeners = this._events[type];
+
+  if (isFunction(listeners)) {
+    this.removeListener(type, listeners);
+  } else if (listeners) {
+    // LIFO order
+    while (listeners.length)
+      this.removeListener(type, listeners[listeners.length - 1]);
+  }
+  delete this._events[type];
+
+  return this;
+};
+
+EventEmitter.prototype.listeners = function(type) {
+  var ret;
+  if (!this._events || !this._events[type])
+    ret = [];
+  else if (isFunction(this._events[type]))
+    ret = [this._events[type]];
+  else
+    ret = this._events[type].slice();
+  return ret;
+};
+
+EventEmitter.prototype.listenerCount = function(type) {
+  if (this._events) {
+    var evlistener = this._events[type];
+
+    if (isFunction(evlistener))
+      return 1;
+    else if (evlistener)
+      return evlistener.length;
+  }
+  return 0;
+};
+
+EventEmitter.listenerCount = function(emitter, type) {
+  return emitter.listenerCount(type);
+};
+
+function isFunction(arg) {
+  return typeof arg === 'function';
+}
+
+function isNumber(arg) {
+  return typeof arg === 'number';
+}
+
+function isObject(arg) {
+  return typeof arg === 'object' && arg !== null;
+}
+
+function isUndefined(arg) {
+  return arg === void 0;
+}
+
+},{}],49:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
 
@@ -18592,25 +22403,40 @@ var process = module.exports = {};
 var cachedSetTimeout;
 var cachedClearTimeout;
 
+function defaultSetTimout() {
+    throw new Error('setTimeout has not been defined');
+}
+function defaultClearTimeout () {
+    throw new Error('clearTimeout has not been defined');
+}
 (function () {
     try {
-        cachedSetTimeout = setTimeout;
-    } catch (e) {
-        cachedSetTimeout = function () {
-            throw new Error('setTimeout is not defined');
+        if (typeof setTimeout === 'function') {
+            cachedSetTimeout = setTimeout;
+        } else {
+            cachedSetTimeout = defaultSetTimout;
         }
+    } catch (e) {
+        cachedSetTimeout = defaultSetTimout;
     }
     try {
-        cachedClearTimeout = clearTimeout;
-    } catch (e) {
-        cachedClearTimeout = function () {
-            throw new Error('clearTimeout is not defined');
+        if (typeof clearTimeout === 'function') {
+            cachedClearTimeout = clearTimeout;
+        } else {
+            cachedClearTimeout = defaultClearTimeout;
         }
+    } catch (e) {
+        cachedClearTimeout = defaultClearTimeout;
     }
 } ())
 function runTimeout(fun) {
     if (cachedSetTimeout === setTimeout) {
         //normal enviroments in sane situations
+        return setTimeout(fun, 0);
+    }
+    // if setTimeout wasn't available but was latter defined
+    if ((cachedSetTimeout === defaultSetTimout || !cachedSetTimeout) && setTimeout) {
+        cachedSetTimeout = setTimeout;
         return setTimeout(fun, 0);
     }
     try {
@@ -18631,6 +22457,11 @@ function runTimeout(fun) {
 function runClearTimeout(marker) {
     if (cachedClearTimeout === clearTimeout) {
         //normal enviroments in sane situations
+        return clearTimeout(marker);
+    }
+    // if clearTimeout wasn't available but was latter defined
+    if ((cachedClearTimeout === defaultClearTimeout || !cachedClearTimeout) && clearTimeout) {
+        cachedClearTimeout = clearTimeout;
         return clearTimeout(marker);
     }
     try {
@@ -18731,6 +22562,10 @@ process.off = noop;
 process.removeListener = noop;
 process.removeAllListeners = noop;
 process.emit = noop;
+process.prependListener = noop;
+process.prependOnceListener = noop;
+
+process.listeners = function (name) { return [] }
 
 process.binding = function (name) {
     throw new Error('process.binding is not supported');
@@ -18742,7 +22577,7 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],41:[function(require,module,exports){
+},{}],50:[function(require,module,exports){
 (function (global){
 /*! https://mths.be/punycode v1.4.1 by @mathias */
 ;(function(root) {
@@ -19280,13 +23115,13 @@ process.umask = function() { return 0; };
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{}],42:[function(require,module,exports){
+},{}],51:[function(require,module,exports){
 (function (process){
 // vim:ts=4:sts=4:sw=4:
 /*!
  *
- * Copyright 2009-2012 Kris Kowal under the terms of the MIT
- * license found at http://github.com/kriskowal/q/raw/master/LICENSE
+ * Copyright 2009-2017 Kris Kowal under the terms of the MIT
+ * license found at https://github.com/kriskowal/q/blob/v1/LICENSE
  *
  * With parts by Tyler Close
  * Copyright 2007-2009 Tyler Close under the terms of the MIT X license found
@@ -19474,7 +23309,7 @@ var nextTick =(function () {
         //   `setTimeout`. In this case `setImmediate` is preferred because
         //    it is faster. Browserify's `process.toString()` yields
         //   "[object Object]", while in a real Node environment
-        //   `process.nextTick()` yields "[object process]".
+        //   `process.toString()` yields "[object process]".
         isNodeJS = true;
 
         requestTick = function () {
@@ -19611,6 +23446,11 @@ var object_create = Object.create || function (prototype) {
     return new Type();
 };
 
+var object_defineProperty = Object.defineProperty || function (obj, prop, descriptor) {
+    obj[prop] = descriptor.value;
+    return obj;
+};
+
 var object_hasOwnProperty = uncurryThis(Object.prototype.hasOwnProperty);
 
 var object_keys = Object.keys || function (object) {
@@ -19661,19 +23501,20 @@ function makeStackTraceLong(error, promise) {
         promise.stack &&
         typeof error === "object" &&
         error !== null &&
-        error.stack &&
-        error.stack.indexOf(STACK_JUMP_SEPARATOR) === -1
+        error.stack
     ) {
         var stacks = [];
         for (var p = promise; !!p; p = p.source) {
-            if (p.stack) {
+            if (p.stack && (!error.__minimumStackCounter__ || error.__minimumStackCounter__ > p.stackCounter)) {
+                object_defineProperty(error, "__minimumStackCounter__", {value: p.stackCounter, configurable: true});
                 stacks.unshift(p.stack);
             }
         }
         stacks.unshift(error.stack);
 
         var concatedStacks = stacks.join("\n" + STACK_JUMP_SEPARATOR + "\n");
-        error.stack = filterStackString(concatedStacks);
+        var stack = filterStackString(concatedStacks);
+        object_defineProperty(error, "stack", {value: stack, configurable: true});
     }
 }
 
@@ -19800,6 +23641,14 @@ Q.nextTick = nextTick;
  */
 Q.longStackSupport = false;
 
+/**
+ * The counter is used to determine the stopping point for building
+ * long stack traces. In makeStackTraceLong we walk backwards through
+ * the linked list of promises, only stacks which were created before
+ * the rejection are concatenated.
+ */
+var longStackCounter = 1;
+
 // enable long stacks if Q_DEBUG is set
 if (typeof process === "object" && process && process.env && process.env.Q_DEBUG) {
     Q.longStackSupport = true;
@@ -19872,6 +23721,7 @@ function defer() {
             // At the same time, cut off the first line; it's always just
             // "[object Promise]\n", as per the `toString`.
             promise.stack = e.stack.substring(e.stack.indexOf("\n") + 1);
+            promise.stackCounter = longStackCounter++;
         }
     }
 
@@ -19881,7 +23731,12 @@ function defer() {
 
     function become(newPromise) {
         resolvedPromise = newPromise;
-        promise.source = newPromise;
+
+        if (Q.longStackSupport && hasStacks) {
+            // Only hold a reference to the new promise if long stacks
+            // are enabled to reduce memory usage
+            promise.source = newPromise;
+        }
 
         array_reduce(messages, function (undefined, message) {
             Q.nextTick(function () {
@@ -20009,7 +23864,7 @@ Promise.prototype.join = function (that) {
             // TODO: "===" should be Object.is or equiv
             return x;
         } else {
-            throw new Error("Can't join: not the same: " + x + " " + y);
+            throw new Error("Q can't join: not the same: " + x + " " + y);
         }
     });
 };
@@ -20906,13 +24761,12 @@ function any(promises) {
         function onFulfilled(result) {
             deferred.resolve(result);
         }
-        function onRejected() {
+        function onRejected(err) {
             pendingCount--;
             if (pendingCount === 0) {
-                deferred.reject(new Error(
-                    "Can't get fulfillment value from any promise, all " +
-                    "promises were rejected."
-                ));
+                err.message = ("Q can't get fulfillment value from any promise, all " +
+                    "promises were rejected. Last error message: " + err.message);
+                deferred.reject(err);
             }
         }
         function onProgress(progress) {
@@ -21036,6 +24890,9 @@ Q["finally"] = function (object, callback) {
 
 Promise.prototype.fin = // XXX legacy
 Promise.prototype["finally"] = function (callback) {
+    if (!callback || typeof callback.apply !== "function") {
+        throw new Error("Q can't apply finally callback");
+    }
     callback = Q(callback);
     return this.then(function (value) {
         return callback.fcall().then(function () {
@@ -21199,6 +25056,9 @@ Promise.prototype.nfcall = function (/*...args*/) {
  */
 Q.nfbind =
 Q.denodeify = function (callback /*...args*/) {
+    if (callback === undefined) {
+        throw new Error("Q can't wrap an undefined function");
+    }
     var baseArgs = array_slice(arguments, 1);
     return function () {
         var nodeArgs = baseArgs.concat(array_slice(arguments));
@@ -21333,7 +25193,7 @@ return Q;
 
 }).call(this,require('_process'))
 
-},{"_process":40}],43:[function(require,module,exports){
+},{"_process":49}],52:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -21419,7 +25279,7 @@ var isArray = Array.isArray || function (xs) {
   return Object.prototype.toString.call(xs) === '[object Array]';
 };
 
-},{}],44:[function(require,module,exports){
+},{}],53:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -21506,317 +25366,13 @@ var objectKeys = Object.keys || function (obj) {
   return res;
 };
 
-},{}],45:[function(require,module,exports){
+},{}],54:[function(require,module,exports){
 'use strict';
 
 exports.decode = exports.parse = require('./decode');
 exports.encode = exports.stringify = require('./encode');
 
-},{"./decode":43,"./encode":44}],46:[function(require,module,exports){
-// Copyright Joyent, Inc. and other Node contributors.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a
-// copy of this software and associated documentation files (the
-// "Software"), to deal in the Software without restriction, including
-// without limitation the rights to use, copy, modify, merge, publish,
-// distribute, sublicense, and/or sell copies of the Software, and to permit
-// persons to whom the Software is furnished to do so, subject to the
-// following conditions:
-//
-// The above copyright notice and this permission notice shall be included
-// in all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
-// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
-// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-// USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-function EventEmitter() {
-  this._events = this._events || {};
-  this._maxListeners = this._maxListeners || undefined;
-}
-module.exports = EventEmitter;
-
-// Backwards-compat with node 0.10.x
-EventEmitter.EventEmitter = EventEmitter;
-
-EventEmitter.prototype._events = undefined;
-EventEmitter.prototype._maxListeners = undefined;
-
-// By default EventEmitters will print a warning if more than 10 listeners are
-// added to it. This is a useful default which helps finding memory leaks.
-EventEmitter.defaultMaxListeners = 10;
-
-// Obviously not all Emitters should be limited to 10. This function allows
-// that to be increased. Set to zero for unlimited.
-EventEmitter.prototype.setMaxListeners = function(n) {
-  if (!isNumber(n) || n < 0 || isNaN(n))
-    throw TypeError('n must be a positive number');
-  this._maxListeners = n;
-  return this;
-};
-
-EventEmitter.prototype.emit = function(type) {
-  var er, handler, len, args, i, listeners;
-
-  if (!this._events)
-    this._events = {};
-
-  // If there is no 'error' event listener then throw.
-  if (type === 'error') {
-    if (!this._events.error ||
-        (isObject(this._events.error) && !this._events.error.length)) {
-      er = arguments[1];
-      if (er instanceof Error) {
-        throw er; // Unhandled 'error' event
-      } else {
-        // At least give some kind of context to the user
-        var err = new Error('Uncaught, unspecified "error" event. (' + er + ')');
-        err.context = er;
-        throw err;
-      }
-    }
-  }
-
-  handler = this._events[type];
-
-  if (isUndefined(handler))
-    return false;
-
-  if (isFunction(handler)) {
-    switch (arguments.length) {
-      // fast cases
-      case 1:
-        handler.call(this);
-        break;
-      case 2:
-        handler.call(this, arguments[1]);
-        break;
-      case 3:
-        handler.call(this, arguments[1], arguments[2]);
-        break;
-      // slower
-      default:
-        args = Array.prototype.slice.call(arguments, 1);
-        handler.apply(this, args);
-    }
-  } else if (isObject(handler)) {
-    args = Array.prototype.slice.call(arguments, 1);
-    listeners = handler.slice();
-    len = listeners.length;
-    for (i = 0; i < len; i++)
-      listeners[i].apply(this, args);
-  }
-
-  return true;
-};
-
-EventEmitter.prototype.addListener = function(type, listener) {
-  var m;
-
-  if (!isFunction(listener))
-    throw TypeError('listener must be a function');
-
-  if (!this._events)
-    this._events = {};
-
-  // To avoid recursion in the case that type === "newListener"! Before
-  // adding it to the listeners, first emit "newListener".
-  if (this._events.newListener)
-    this.emit('newListener', type,
-              isFunction(listener.listener) ?
-              listener.listener : listener);
-
-  if (!this._events[type])
-    // Optimize the case of one listener. Don't need the extra array object.
-    this._events[type] = listener;
-  else if (isObject(this._events[type]))
-    // If we've already got an array, just append.
-    this._events[type].push(listener);
-  else
-    // Adding the second element, need to change to array.
-    this._events[type] = [this._events[type], listener];
-
-  // Check for listener leak
-  if (isObject(this._events[type]) && !this._events[type].warned) {
-    if (!isUndefined(this._maxListeners)) {
-      m = this._maxListeners;
-    } else {
-      m = EventEmitter.defaultMaxListeners;
-    }
-
-    if (m && m > 0 && this._events[type].length > m) {
-      this._events[type].warned = true;
-      console.error('(node) warning: possible EventEmitter memory ' +
-                    'leak detected. %d listeners added. ' +
-                    'Use emitter.setMaxListeners() to increase limit.',
-                    this._events[type].length);
-      if (typeof console.trace === 'function') {
-        // not supported in IE 10
-        console.trace();
-      }
-    }
-  }
-
-  return this;
-};
-
-EventEmitter.prototype.on = EventEmitter.prototype.addListener;
-
-EventEmitter.prototype.once = function(type, listener) {
-  if (!isFunction(listener))
-    throw TypeError('listener must be a function');
-
-  var fired = false;
-
-  function g() {
-    this.removeListener(type, g);
-
-    if (!fired) {
-      fired = true;
-      listener.apply(this, arguments);
-    }
-  }
-
-  g.listener = listener;
-  this.on(type, g);
-
-  return this;
-};
-
-// emits a 'removeListener' event iff the listener was removed
-EventEmitter.prototype.removeListener = function(type, listener) {
-  var list, position, length, i;
-
-  if (!isFunction(listener))
-    throw TypeError('listener must be a function');
-
-  if (!this._events || !this._events[type])
-    return this;
-
-  list = this._events[type];
-  length = list.length;
-  position = -1;
-
-  if (list === listener ||
-      (isFunction(list.listener) && list.listener === listener)) {
-    delete this._events[type];
-    if (this._events.removeListener)
-      this.emit('removeListener', type, listener);
-
-  } else if (isObject(list)) {
-    for (i = length; i-- > 0;) {
-      if (list[i] === listener ||
-          (list[i].listener && list[i].listener === listener)) {
-        position = i;
-        break;
-      }
-    }
-
-    if (position < 0)
-      return this;
-
-    if (list.length === 1) {
-      list.length = 0;
-      delete this._events[type];
-    } else {
-      list.splice(position, 1);
-    }
-
-    if (this._events.removeListener)
-      this.emit('removeListener', type, listener);
-  }
-
-  return this;
-};
-
-EventEmitter.prototype.removeAllListeners = function(type) {
-  var key, listeners;
-
-  if (!this._events)
-    return this;
-
-  // not listening for removeListener, no need to emit
-  if (!this._events.removeListener) {
-    if (arguments.length === 0)
-      this._events = {};
-    else if (this._events[type])
-      delete this._events[type];
-    return this;
-  }
-
-  // emit removeListener for all listeners on all events
-  if (arguments.length === 0) {
-    for (key in this._events) {
-      if (key === 'removeListener') continue;
-      this.removeAllListeners(key);
-    }
-    this.removeAllListeners('removeListener');
-    this._events = {};
-    return this;
-  }
-
-  listeners = this._events[type];
-
-  if (isFunction(listeners)) {
-    this.removeListener(type, listeners);
-  } else if (listeners) {
-    // LIFO order
-    while (listeners.length)
-      this.removeListener(type, listeners[listeners.length - 1]);
-  }
-  delete this._events[type];
-
-  return this;
-};
-
-EventEmitter.prototype.listeners = function(type) {
-  var ret;
-  if (!this._events || !this._events[type])
-    ret = [];
-  else if (isFunction(this._events[type]))
-    ret = [this._events[type]];
-  else
-    ret = this._events[type].slice();
-  return ret;
-};
-
-EventEmitter.prototype.listenerCount = function(type) {
-  if (this._events) {
-    var evlistener = this._events[type];
-
-    if (isFunction(evlistener))
-      return 1;
-    else if (evlistener)
-      return evlistener.length;
-  }
-  return 0;
-};
-
-EventEmitter.listenerCount = function(emitter, type) {
-  return emitter.listenerCount(type);
-};
-
-function isFunction(arg) {
-  return typeof arg === 'function';
-}
-
-function isNumber(arg) {
-  return typeof arg === 'number';
-}
-
-function isObject(arg) {
-  return typeof arg === 'object' && arg !== null;
-}
-
-function isUndefined(arg) {
-  return arg === void 0;
-}
-
-},{}],47:[function(require,module,exports){
+},{"./decode":52,"./encode":53}],55:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -22550,7 +26106,7 @@ Url.prototype.parseHost = function() {
   if (host) this.hostname = host;
 };
 
-},{"./util":48,"punycode":41,"querystring":45}],48:[function(require,module,exports){
+},{"./util":56,"punycode":50,"querystring":54}],56:[function(require,module,exports){
 'use strict';
 
 module.exports = {
