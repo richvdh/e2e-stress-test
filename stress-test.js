@@ -141,9 +141,19 @@ class ClientInstance {
         }
 
         console.log("send");
-        this._matrixClient.sendTextMessage(this._roomId,
-            "test " + (this._msgCounter++)
-        ).catch(showError).then(() => {
+        const body = "test " + (this._msgCounter++);
+        this._matrixClient.sendTextMessage(this._roomId, body).catch((e) => {
+            if (e.name !== 'UnknownDeviceError') {
+                throw e;
+            }
+            for (const userId of Object.keys(e.devices)) {
+                for (const deviceId of Object.keys(e.devices[userId])) {
+                    console.log(`marking ${userId}:${deviceId} known`);
+                    this._matrixClient.setDeviceKnown(userId, deviceId);
+                }
+            }
+            return this._matrixClient.sendTextMessage(this._roomId, body);
+        }).catch(showError).then(() => {
             // reload once every 10 messages
             if (Math.random() < 0.1) {
                 console.log("reload");
